@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <title>OpenView — graphique sur grille noire</title>
+  <rect width="128" height="128" fill="#000"/>
+  <g fill="none" stroke="#292929" stroke-width="1">
+    <path d="M16 0v128M40 0v128M64 0v128M88 0v128M112 0v128"/>
+    <path d="M0 16h128M0 40h128M0 64h128M0 88h128M0 112h128"/>
+  </g>
+  <path d="m12 91 20-14 18 7 17-28 17 10 18-31 16 7"
+        fill="none" stroke="#00E676" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -34,6 +34,8 @@ typedef struct {
     AlertLogEntry   toast_entry;
     int64_t         toast_until_ms;
     uint64_t        last_primary_tick_ms;
+    float           wl_scroll;
+    int             wl_wheel_remainder;
     int             wl_drag_kind;
     uint32_t        wl_drag_id;
     bool            wl_drag_active;
@@ -71,6 +73,8 @@ typedef struct {
     uint32_t    wl_sec_ids[MAX_WL_SECTIONS];
     size_t      wl_sec_visible_count;
 
+    D2D1_RECT_F wl_list_rect;
+    float       wl_scroll_max;
     D2D1_RECT_F wl_rows[MAX_WATCHLIST];
     D2D1_RECT_F wl_rename_btns[MAX_WATCHLIST];
     D2D1_RECT_F wl_move_btns[MAX_WATCHLIST];

@@ -79,12 +79,10 @@ static void dlg_theme_apply_children(HWND dlg, const DlgThemeCtx* tc, HFONT font
             pfnAllow(child, tc->dark_theme ? TRUE : FALSE);
         }
         if (pfnTheme) {
-            wchar_t cls[32] = L"";
-            GetClassNameW(child, cls, 32);
-            if (_wcsicmp(cls, L"ComboBox") == 0) {
-                pfnTheme(child, tc->dark_theme ? L"DarkMode_CFD" : L"Explorer", NULL);
+            if (tc->dark_theme) {
+                pfnTheme(child, L"", L"");
             } else {
-                pfnTheme(child, tc->dark_theme ? L"DarkMode_Explorer" : L"Explorer", NULL);
+                pfnTheme(child, L"Explorer", NULL);
             }
         }
         child = GetWindow(child, GW_HWNDNEXT);
@@ -192,6 +190,7 @@ static bool dlg_theme_handle_msg(
     }
     if (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN) {
         HDC hdc = (HDC)wParam;
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, tc->dark_theme ? RGB(209, 212, 220) : RGB(15, 23, 42));
         SetBkColor(hdc,   tc->dark_theme ? RGB(30, 34, 45)   : RGB(255, 255, 255));
         *out_res = (LRESULT)tc->br_bg;

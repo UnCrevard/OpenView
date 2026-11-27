@@ -9,12 +9,14 @@ ifeq ($(OS),Windows_NT)
   ifeq ($(origin CC),default)
     CC := gcc
   endif
+  WINDRES ?= windres
   MKDIR = if not exist bin mkdir bin
   RM = if exist bin rmdir /s /q bin
 else
   ifeq ($(origin CC),default)
     CC := x86_64-w64-mingw32-gcc
   endif
+  WINDRES ?= x86_64-w64-mingw32-windres
   MKDIR = mkdir -p bin
   RM = rm -rf bin
 endif
@@ -22,6 +24,7 @@ endif
 TARGET   := OpenView.exe
 SRC_DIR  := C/src
 INC_DIR  := C/include
+RES_OBJ  := bin/OpenView_res.o
 
 SRCS := \
 	$(SRC_DIR)/main.c \
@@ -45,8 +48,12 @@ LDFLAGS := -s -mwindows -municode \
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
+$(RES_OBJ): OpenView.rc assets/icons/openview.ico
+	$(MKDIR)
+	$(WINDRES) $< -O coff -o $@
+
+$(TARGET): $(SRCS) $(RES_OBJ)
+	$(CC) $(CFLAGS) $(SRCS) $(RES_OBJ) -o $(TARGET) $(LDFLAGS)
 
 run: $(TARGET)
 	./$(TARGET)

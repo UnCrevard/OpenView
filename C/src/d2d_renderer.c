@@ -26,6 +26,22 @@ static inline bool pt_in_rect(D2D1_RECT_F rc, float x, float y) {
     return x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom;
 }
 
+static bool watchlist_item_belongs_to_section(
+    const WatchlistItem* item,
+    const WatchlistSection* section,
+    size_t section_index,
+    const WatchlistSection* sections,
+    size_t section_count
+) {
+    if (item->removed) return false;
+    if (item->section_id == section->id) return true;
+    if (section_index != 0) return false;
+    for (size_t i = 0; i < section_count; i++) {
+        if (sections[i].id == item->section_id) return false;
+    }
+    return true;
+}
+
 static void set_brush_argb(ID2D1SolidColorBrush* br, uint32_t argb, float alpha_override) {
     float a = (alpha_override >= 0.0f) ? alpha_override : ((float)((argb >> 24) & 0xFF) / 255.0f);
     D2D1_COLOR_F col = {
@@ -768,6 +784,20 @@ void d2d_renderer_paint(
 
         double min_p = primary_bars[start_idx].low;
         double max_p = primary_bars[start_idx].high;
+        double live_price = primary_bars[primary_count - 1].close;
+        for (size_t w = 0; w < watchlist_count; w++) {
+            const WatchlistItem* it = &watchlist[w];
+            if (it->removed) continue;
+            bool is_active = (feed->active_entry_id != 0)
+                ? (it->id == feed->active_entry_id)
+                : (wcscmp(it->symbol, feed->active_symbol) == 0);
+            if (is_active) {
+                if (it->price > 0.0) live_price = it->price;
+                break;
+            }
+        }
+        if (live_price < min_p) min_p = live_price;
+        if (live_price > max_p) max_p = live_price;
         double max_v = 0.0;
         for (int i = start_idx; i <= render_end; i++) {
             if (primary_bars[i].low < min_p)    min_p = primary_bars[i].low;
@@ -1066,17 +1096,18 @@ void d2d_renderer_paint(
         ID2D1HwndRenderTarget_PopAxisAlignedClip(r->target);
 
         /* Last price horizontal badge on right axis */
-        const CandleBar* last_bar = &primary_bars[primary_count - 1];
-        float last_y = P2Y(last_bar->close);
+        float last_y = P2Y(live_price);
         if (last_y >= main_top && last_y <= main_bot) {
-            uint32_t lcol = (last_bar->close >= last_bar->open) ? col_bull : col_bear;
-            set_brush_argb(r->brush_dyn, lcol, 0.45f);
-            ID2D1HwndRenderTarget_DrawLine(r->target, d2d_pt(c_left, last_y), d2d_pt(c_right, last_y), (ID2D1Brush*)r->brush_dyn, 1.0f, r->stroke_dotted);
+            set_brush_argb(r->brush_dyn, col_accent, 1.0f);
+            ID2D1HwndRenderTarget_DrawLine(
+                r->target, d2d_pt(c_left, last_y), d2d_pt(c_right, last_y),
+                (ID2D1Brush*)r->brush_dyn, 2.5f, r->stroke_dotted
+            );
 
             wchar_t lbuf[32];
-            format_price_w(last_bar->close, lbuf, 32);
+            format_price_w(live_price, lbuf, 32);
             D2D1_RECT_F tag_rc = { c_right + 2.0f, last_y - 10.0f, c_right + price_w - 2.0f, last_y + 10.0f };
-            draw_btn_box(r, tag_rc, lcol, lcol, lbuf, 0xFFFFFFFFU, r->font_mono);
+            draw_btn_box(r, tag_rc, col_accent, col_accent, lbuf, 0xFFFFFFFFU, r->font_mono);
         }
 
         /* =================================================================
@@ -1271,12 +1302,44 @@ void d2d_renderer_paint(
             }
         }
 
-        const float list_max_y = h_dip - 126.0f;
-        for (size_t si = 0; si < section_count && sy_cur + 26.0f < list_max_y; si++) {
+        const float list_top = sy_cur;
+        float list_bottom = h_dip - 126.0f;
+        if (list_bottom < list_top) list_bottom = list_top;
+        L->wl_list_rect = (D2D1_RECT_F){ rx, list_top, w_dip, list_bottom };
+
+        float content_height = 0.0f;
+        for (size_t si = 0; si < section_count; si++) {
             const WatchlistSection* sec = &sections[si];
             size_t sec_cnt = 0;
             for (size_t w = 0; w < watchlist_count; w++) {
-                if (!watchlist[w].removed && watchlist[w].section_id == sec->id) sec_cnt++;
+                if (watchlist_item_belongs_to_section(&watchlist[w], sec, si, sections, section_count)) {
+                    sec_cnt++;
+                }
+            }
+            content_height += 27.0f;
+            if (!sec->collapsed) content_height += (float)sec_cnt * 44.0f;
+        }
+
+        float list_height = list_bottom - list_top;
+        L->wl_scroll_max = content_height > list_height ? content_height - list_height : 0.0f;
+        float list_scroll = vp->wl_scroll;
+        if (list_scroll < 0.0f) list_scroll = 0.0f;
+        if (list_scroll > L->wl_scroll_max) list_scroll = L->wl_scroll_max;
+        sy_cur = list_top - list_scroll;
+        bool clip_list = list_height > 0.0f;
+        if (clip_list) {
+            ID2D1HwndRenderTarget_PushAxisAlignedClip(
+                r->target, &L->wl_list_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+            );
+        }
+
+        for (size_t si = 0; si < section_count; si++) {
+            const WatchlistSection* sec = &sections[si];
+            size_t sec_cnt = 0;
+            for (size_t w = 0; w < watchlist_count; w++) {
+                if (watchlist_item_belongs_to_section(&watchlist[w], sec, si, sections, section_count)) {
+                    sec_cnt++;
+                }
             }
 
             float sec_block_top = sy_cur;
@@ -1321,18 +1384,9 @@ void d2d_renderer_paint(
             sy_cur += 27.0f;
 
             if (!sec->collapsed) {
-                for (size_t w = 0; w < watchlist_count && sy_cur + 44.0f < list_max_y; w++) {
+                for (size_t w = 0; w < watchlist_count; w++) {
                     const WatchlistItem* it = &watchlist[w];
-                    if (it->removed) continue;
-                    bool belongs = (it->section_id == sec->id);
-                    if (!belongs && si == 0) {
-                        bool found_sec = false;
-                        for (size_t k = 0; k < section_count; k++) {
-                            if (sections[k].id == it->section_id) { found_sec = true; break; }
-                        }
-                        if (!found_sec) belongs = true;
-                    }
-                    if (!belongs) continue;
+                    if (!watchlist_item_belongs_to_section(it, sec, si, sections, section_count)) continue;
                     if (L->wl_visible_count >= MAX_WATCHLIST) break;
 
                     bool is_act = (feed->active_entry_id != 0)
@@ -1400,6 +1454,7 @@ void d2d_renderer_paint(
                 }
             }
         }
+        if (clip_list) ID2D1HwndRenderTarget_PopAxisAlignedClip(r->target);
 
         /* Floating drag ghost near cursor */
         if (vp->wl_drag_active && vp->wl_drag_id != 0) {

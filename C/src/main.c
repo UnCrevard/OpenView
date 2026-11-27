@@ -108,6 +108,7 @@ static void ov_enable_modern_windows_ui(bool dark) {
 
 #define ID_TOAST_TIMER 1
 #define IDM_SYM_BASE   3000
+#define IDM_DRAWING_BASE 4000
 
 typedef enum {
     DRAG_NONE = 0,
@@ -190,6 +191,18 @@ static void persist_drawings(const AppState* app) {
     }
 }
 
+static bool drawing_label_to_hex(const wchar_t* label, char* out, size_t cap) {
+    size_t pos = 0;
+    for (size_t i = 0; label[i]; i++) {
+        int n = snprintf(out + pos, cap - pos, "%04X", (unsigned)(uint16_t)label[i]);
+        if (n != 4 || (size_t)n >= cap - pos) return false;
+        pos += (size_t)n;
+    }
+    if (pos >= cap) return false;
+    out[pos] = '\0';
+    return true;
+}
+
 typedef struct {
     TimeframeSec timeframe;
     FeedSourceId primary_source;
@@ -199,16 +212,10 @@ typedef struct {
 static void persist_settings(
     TimeframeSec timeframe,
     FeedSourceId primary_source,
-    const IndicatorSettings* indicators
+    const IndicatorSettings* indicators,
+    const DrawingStyleDefaults* drawing_defaults
 ) {
-    wchar_t path[MAX_PATH];
-    if (!ov_state_path(path, MAX_PATH, L"openview_settings.json")) return;
-    HANDLE h = CreateFileW(
-        path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
-    );
-    if (h == INVALID_HANDLE_VALUE) return;
-
-    char json[512];
+    char json[4096];
     int len = snprintf(
         json, sizeof(json),
         "{\"timeframe\":%d,\"primary_source\":%d,"
@@ -216,7 +223,7 @@ static void persist_settings(
         "\"enable_sma\":%d,\"enable_bb\":%d,\"enable_rsi\":%d,\"enable_macd\":%d,"
         "\"ema_fast_period\":%d,\"ema_slow_period\":%d,\"sma_period\":%d,"
         "\"bb_period\":%d,\"bb_stddev\":%.6f,\"rsi_period\":%d,"
-        "\"macd_fast\":%d,\"macd_slow\":%d,\"macd_signal\":%d}\n",
+        "\"macd_fast\":%d,\"macd_slow\":%d,\"macd_signal\":%d",
         (int)timeframe, (int)primary_source,
         indicators->enable_ema_fast, indicators->enable_ema_slow,
         indicators->enable_sma, indicators->enable_bb,
@@ -226,10 +233,37 @@ static void persist_settings(
         indicators->rsi_period, indicators->macd_fast, indicators->macd_slow,
         indicators->macd_signal
     );
-    DWORD written = 0;
-    if (len > 0 && (size_t)len < sizeof(json)) {
-        WriteFile(h, json, (DWORD)len, &written, NULL);
+    if (len <= 0 || (size_t)len >= sizeof(json)) return;
+    size_t pos = (size_t)len;
+    for (int kind = TOOL_TRENDLINE; kind <= TOOL_TEXT; kind++) {
+        const DrawingStyleDefaults* style = &drawing_defaults[kind];
+        char label_hex[260];
+        if (!drawing_label_to_hex(style->label, label_hex, sizeof(label_hex))) return;
+        int n = snprintf(
+            json + pos, sizeof(json) - pos,
+            ",\"drawing_%d_color\":%u,\"drawing_%d_width\":%.3f,"
+            "\"drawing_%d_line_style\":%d,\"drawing_%d_align_h\":%d,"
+            "\"drawing_%d_align_v\":%d,\"drawing_%d_label_utf16_hex\":\"%s\"",
+            kind, style->color, kind, (double)style->width,
+            kind, (int)style->line_style, kind, (int)style->align_h,
+            kind, (int)style->align_v, kind, label_hex
+        );
+        if (n <= 0 || (size_t)n >= sizeof(json) - pos) return;
+        pos += (size_t)n;
     }
+
+    len = snprintf(json + pos, sizeof(json) - pos, "}\n");
+    if (len <= 0 || (size_t)len >= sizeof(json) - pos) return;
+    pos += (size_t)len;
+
+    wchar_t path[MAX_PATH];
+    if (!ov_state_path(path, MAX_PATH, L"openview_settings.json")) return;
+    HANDLE h = CreateFileW(
+        path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, json, (DWORD)pos, &written, NULL);
     CloseHandle(h);
 }
 
@@ -261,6 +295,104 @@ static bool settings_read_double(const char* json, const char* key, double* out)
     return true;
 }
 
+static bool settings_read_uint32(const char* json, const char* key, uint32_t* out) {
+    char field[64];
+    int len = snprintf(field, sizeof(field), "\"%s\":", key);
+    if (len <= 0 || (size_t)len >= sizeof(field)) return false;
+    const char* value = strstr(json, field);
+    if (!value) return false;
+    value += len;
+    char* end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || parsed > UINT32_MAX) return false;
+    *out = (uint32_t)parsed;
+    return true;
+}
+
+static bool settings_read_drawing_label(
+    const char* json,
+    const char* key,
+    wchar_t* out,
+    size_t cap
+) {
+    char field[80];
+    int len = snprintf(field, sizeof(field), "\"%s\":\"", key);
+    if (len <= 0 || (size_t)len >= sizeof(field)) return false;
+    const char* value = strstr(json, field);
+    if (!value) return false;
+    value += len;
+
+    size_t count = 0;
+    while (*value && *value != '"') {
+        if (count + 1 >= cap) return false;
+        if (strlen(value) < 4) return false;
+        for (size_t i = 0; i < 4; i++) {
+            if (!isxdigit((unsigned char)value[i])) return false;
+        }
+        char hex[5];
+        memcpy(hex, value, 4);
+        hex[4] = '\0';
+        char* end = NULL;
+        unsigned long code_unit = strtoul(hex, &end, 16);
+        if (end != hex + 4 || code_unit > 0xFFFFUL) return false;
+        out[count++] = (wchar_t)code_unit;
+        value += 4;
+    }
+    if (*value != '"') return false;
+    out[count] = L'\0';
+    return true;
+}
+
+static void load_drawing_defaults(AppState* app) {
+    wchar_t path[MAX_PATH];
+    if (!ov_state_path(path, MAX_PATH, L"openview_settings.json")) return;
+    HANDLE h = CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char json[4096];
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, json, sizeof(json) - 1, &got, NULL);
+    CloseHandle(h);
+    if (!ok || got == 0) return;
+    json[got] = '\0';
+
+    for (int kind = TOOL_TRENDLINE; kind <= TOOL_TEXT; kind++) {
+        DrawingStyleDefaults* style = &app->drawing_defaults[kind];
+        char key[64];
+        long value;
+        uint32_t color;
+        double width;
+
+        snprintf(key, sizeof(key), "drawing_%d_color", kind);
+        if (settings_read_uint32(json, key, &color)) style->color = color;
+
+        snprintf(key, sizeof(key), "drawing_%d_width", kind);
+        if (settings_read_double(json, key, &width) && width >= 0.2 && width <= 20.0) {
+            style->width = (float)width;
+        }
+
+        snprintf(key, sizeof(key), "drawing_%d_line_style", kind);
+        if (settings_read_long(json, key, &value) && value >= LINE_SOLID && value <= LINE_DOTTED) {
+            style->line_style = (DrawingLineStyle)value;
+        }
+
+        snprintf(key, sizeof(key), "drawing_%d_align_h", kind);
+        if (settings_read_long(json, key, &value) && value >= ALIGN_H_LEFT && value <= ALIGN_H_RIGHT) {
+            style->align_h = (DrawingLabelAlignH)value;
+        }
+
+        snprintf(key, sizeof(key), "drawing_%d_align_v", kind);
+        if (settings_read_long(json, key, &value) && value >= ALIGN_V_TOP && value <= ALIGN_V_BOTTOM) {
+            style->align_v = (DrawingLabelAlignV)value;
+        }
+
+        snprintf(key, sizeof(key), "drawing_%d_label_utf16_hex", kind);
+        settings_read_drawing_label(json, key, style->label, sizeof(style->label) / sizeof(style->label[0]));
+    }
+}
+
 static AppSettings load_settings(void) {
     AppSettings settings = {0};
     settings.timeframe = TF_15M;
@@ -273,7 +405,7 @@ static AppSettings load_settings(void) {
     );
     if (h == INVALID_HANDLE_VALUE) return settings;
 
-    char buf[512];
+    char buf[4096];
     DWORD got = 0;
     BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
     CloseHandle(h);
@@ -359,6 +491,7 @@ static uint32_t add_drawing_with_defaults(
     if (drawing) {
         drawing->label_align_h = style->align_h;
         drawing->label_align_v = style->align_v;
+        drawing->locked = true;
     }
     return id;
 }
@@ -543,6 +676,111 @@ static void show_symbol_menu(AppState* app, HWND hwnd) {
     }
 }
 
+static void edit_drawing(AppState* app, HWND hwnd, uint32_t drawing_id) {
+    ChartDrawing* dr = drawings_find_by_id(&app->drawings, drawing_id);
+    if (!dr) return;
+
+    app->viewport.selected_drawing_id = drawing_id;
+    int result = ui_show_drawing_dialog(hwnd, dr, app->viewport.dark_theme);
+    if (result == 2) {
+        drawings_remove_by_id(&app->drawings, drawing_id);
+        app->viewport.selected_drawing_id = 0;
+        persist_drawings(app);
+    } else if (result == 1) {
+        if (dr->kind > TOOL_CURSOR && dr->kind <= TOOL_TEXT) {
+            DrawingStyleDefaults* style = &app->drawing_defaults[dr->kind];
+            style->color = dr->argb_color;
+            style->width = dr->stroke_width;
+            style->line_style = dr->line_style;
+            style->align_h = dr->label_align_h;
+            style->align_v = dr->label_align_v;
+            ov_wcscpy(style->label, 64, dr->label);
+            app->viewport.drawing_color = dr->argb_color;
+            persist_settings(
+                app->feed.timeframe, app->feed.primary_source, &app->ind_cfg,
+                app->drawing_defaults
+            );
+        }
+        persist_drawings(app);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static const wchar_t* drawing_kind_label(DrawingToolKind kind) {
+    switch (kind) {
+        case TOOL_TRENDLINE: return L"Ligne de tendance";
+        case TOOL_HLINE:     return L"Ligne horizontale";
+        case TOOL_FIBONACCI: return L"Fibonacci";
+        case TOOL_CHANNEL:   return L"Canal";
+        case TOOL_RECTANGLE: return L"Rectangle";
+        case TOOL_TEXT:      return L"Texte";
+        default:             return L"Dessin";
+    }
+}
+
+static void show_drawing_menu(AppState* app, HWND hwnd, LPARAM lParam) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        MessageBoxW(hwnd, L"Impossible d'ouvrir la liste des dessins.",
+                    L"Gestion des dessins", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    uint32_t drawing_ids[MAX_DRAWINGS];
+    size_t item_count = 0;
+    bool is_primary_entry = is_active_entry_primary(app);
+    for (size_t i = 0; i < app->drawings.count; i++) {
+        const ChartDrawing* dr = &app->drawings.items[i];
+        if (!drawings_matches_scope(
+                dr, app->feed.active_entry_id, app->feed.active_symbol, is_primary_entry)) {
+            continue;
+        }
+
+        wchar_t item_text[144];
+        const wchar_t* kind = drawing_kind_label(dr->kind);
+        if (dr->label[0]) {
+            swprintf(item_text, 144, L"%ls — %ls", kind, dr->label);
+        } else if (dr->kind == TOOL_HLINE && dr->pt_count > 0) {
+            swprintf(item_text, 144, L"%ls — %.6g", kind, dr->pts[0].price);
+        } else {
+            swprintf(item_text, 144, L"%ls — Sans nom", kind);
+        }
+
+        UINT command = IDM_DRAWING_BASE + (UINT)item_count;
+        if (!AppendMenuW(menu, MF_STRING, command, item_text)) {
+            DestroyMenu(menu);
+            MessageBoxW(hwnd, L"Impossible de charger la liste des dessins.",
+                        L"Gestion des dessins", MB_OK | MB_ICONERROR);
+            return;
+        }
+        drawing_ids[item_count++] = dr->id;
+    }
+
+    if (item_count == 0 &&
+        !AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Aucun dessin pour ce token")) {
+        DestroyMenu(menu);
+        MessageBoxW(hwnd, L"Impossible d'afficher la liste des dessins.",
+                    L"Gestion des dessins", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    ClientToScreen(hwnd, &pt);
+    ov_apply_uxtheme_app_mode(hwnd, app->viewport.dark_theme);
+    SetForegroundWindow(hwnd);
+    UINT command = (UINT)TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+        pt.x, pt.y, 0, hwnd, NULL
+    );
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+
+    if (command >= IDM_DRAWING_BASE &&
+        command < IDM_DRAWING_BASE + (UINT)item_count) {
+        edit_drawing(app, hwnd, drawing_ids[command - IDM_DRAWING_BASE]);
+    }
+}
+
 typedef struct {
     AppState* app;
     HWND hwnd;
@@ -577,7 +815,10 @@ static bool add_token_to_watchlist(
         feed_manager_set_primary_source(&action->app->feed, SRC_COINGECKO);
     } else if (action->app->feed.primary_source == SRC_COINGECKO) {
         feed_manager_set_primary_source(&action->app->feed, action->source);
-        persist_settings(action->app->feed.timeframe, action->source, &action->app->ind_cfg);
+        persist_settings(
+            action->app->feed.timeframe, action->source, &action->app->ind_cfg,
+            action->app->drawing_defaults
+        );
     }
     persist_drawings(action->app);
     action->app->viewport.draft_count = 0;
@@ -627,7 +868,10 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
         if (pt_in(L->tf_btns[i], x_dip, y_dip)) {
             feed_manager_set_timeframe(&app->feed, L->tf_values[i]);
             app->viewport.last_primary_tick_ms = 0;
-            persist_settings(L->tf_values[i], app->feed.primary_source, &app->ind_cfg);
+            persist_settings(
+                L->tf_values[i], app->feed.primary_source, &app->ind_cfg,
+                app->drawing_defaults
+            );
             app->viewport.draft_count = 0;
             app->viewport.pan_bars = 4.0f;
             app->viewport.y_pan_factor = 0.0f;
@@ -638,7 +882,10 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
     }
     if (pt_in(L->ind_btn, x_dip, y_dip)) {
         if (ui_show_indicators_dialog(hwnd, &app->ind_cfg, app->viewport.dark_theme)) {
-            persist_settings(app->feed.timeframe, app->feed.primary_source, &app->ind_cfg);
+            persist_settings(
+                app->feed.timeframe, app->feed.primary_source, &app->ind_cfg,
+                app->drawing_defaults
+            );
             refresh_analytics(app, hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -685,6 +932,10 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                     persist_drawings(app);
                 }
             }
+            persist_settings(
+                app->feed.timeframe, app->feed.primary_source, &app->ind_cfg,
+                app->drawing_defaults
+            );
             InvalidateRect(hwnd, NULL, FALSE);
             return true;
         }
@@ -745,13 +996,15 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
         size_t sn = feed_manager_copy_sections(&app->feed, secs, MAX_WL_SECTIONS);
         for (size_t s = 0; s < L->wl_sec_visible_count; s++) {
             uint32_t sid = L->wl_sec_ids[s];
-            if (pt_in(L->wl_sec_del_btns[s], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_sec_del_btns[s], x_dip, y_dip)) {
                 feed_manager_delete_section(&app->feed, sid);
                 persist_drawings(app);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return true;
             }
-            if (pt_in(L->wl_sec_rename_btns[s], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_sec_rename_btns[s], x_dip, y_dip)) {
                 wchar_t sname[48] = L"";
                 for (size_t k = 0; k < sn; k++) {
                     if (secs[k].id == sid) { ov_wcscpy(sname, 48, secs[k].name); break; }
@@ -774,7 +1027,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
             if (wi >= wn) continue;
             uint32_t eid = L->wl_entry_ids[i];
 
-            if (pt_in(L->wl_rename_btns[i], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_rename_btns[i], x_dip, y_dip)) {
                 wchar_t disp[48];
                 ov_wcscpy(disp, 48, wl[wi].display_name);
                 wchar_t prompt_lbl[80];
@@ -788,7 +1042,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                 }
                 return true;
             }
-            if (pt_in(L->wl_move_btns[i], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_move_btns[i], x_dip, y_dip)) {
                 uint32_t target_sec = wl[wi].section_id;
                 const wchar_t* lbl = wl[wi].display_name[0] ? wl[wi].display_name : wl[wi].symbol;
                 if (ui_show_move_section_dialog(
@@ -800,7 +1055,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                 }
                 return true;
             }
-            if (pt_in(L->wl_clone_btns[i], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_clone_btns[i], x_dip, y_dip)) {
                 feed_manager_clone_entry(&app->feed, eid);
                 persist_drawings(app);
                 app->viewport.draft_count = 0;
@@ -809,7 +1065,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                 InvalidateRect(hwnd, NULL, FALSE);
                 return true;
             }
-            if (pt_in(L->wl_del_btns[i], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_del_btns[i], x_dip, y_dip)) {
                 drawings_remove_by_entry(&app->drawings, eid);
                 feed_manager_remove_entry(&app->feed, eid);
                 persist_drawings(app);
@@ -822,7 +1079,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
         }
 
         for (size_t s = 0; s < L->wl_sec_visible_count; s++) {
-            if (pt_in(L->wl_sec_headers[s], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_sec_headers[s], x_dip, y_dip)) {
                 app->drag_mode                    = DRAG_WL_SECTION;
                 app->drag_start_x_dip             = x_dip;
                 app->drag_start_y_dip             = y_dip;
@@ -839,7 +1097,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
         for (size_t i = 0; i < L->wl_visible_count; i++) {
             size_t wi = L->wl_indices[i];
             if (wi >= wn) continue;
-            if (pt_in(L->wl_rows[i], x_dip, y_dip)) {
+            if (pt_in(L->wl_list_rect, x_dip, y_dip) &&
+                pt_in(L->wl_rows[i], x_dip, y_dip)) {
                 app->drag_mode                    = DRAG_WL_ENTRY;
                 app->drag_start_x_dip             = x_dip;
                 app->drag_start_y_dip             = y_dip;
@@ -885,7 +1144,10 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
             if (pt_in(L->src_primary_btns[s], x_dip, y_dip)) {
                 feed_manager_set_primary_source(&app->feed, (FeedSourceId)s);
                 app->viewport.last_primary_tick_ms = 0;
-                persist_settings(app->feed.timeframe, (FeedSourceId)s, &app->ind_cfg);
+                persist_settings(
+                    app->feed.timeframe, (FeedSourceId)s, &app->ind_cfg,
+                    app->drawing_defaults
+                );
                 refresh_analytics(app, hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return true;
@@ -942,6 +1204,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             feed_manager_init(&app->feed, hwnd);
             AppSettings saved_settings = load_settings();
             app->ind_cfg = saved_settings.indicators;
+            load_drawing_defaults(app);
             if (saved_settings.timeframe != TF_15M) {
                 feed_manager_set_timeframe(&app->feed, saved_settings.timeframe);
             }
@@ -1005,6 +1268,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 if (needs_redraw) InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
+
+        case WM_RBUTTONDOWN:
+            if (app) {
+                float dpi = get_dpi_scale(hwnd);
+                float x_dip = (float)GET_X_LPARAM(lParam) / dpi;
+                float y_dip = (float)GET_Y_LPARAM(lParam) / dpi;
+                if (pt_in(app->renderer.layout.main_pane_rect, x_dip, y_dip)) {
+                    show_drawing_menu(app, hwnd, lParam);
+                    return 0;
+                }
+            }
+            break;
 
         case WM_LBUTTONDOWN:
             if (app) {
@@ -1140,29 +1415,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                 L, bars, &app->drawings,
                                 app->feed.active_entry_id, app->feed.active_symbol, is_active_entry_primary(app),
                                 x_dip, y_dip, &hit_id, &pt_idx)) {
-                            app->viewport.selected_drawing_id = hit_id;
-                            ChartDrawing* dr = drawings_find_by_id(&app->drawings, hit_id);
-                            if (dr) {
-                                int res = ui_show_drawing_dialog(hwnd, dr, app->viewport.dark_theme);
-                                if (res == 2) {
-                                    drawings_remove_by_id(&app->drawings, hit_id);
-                                    app->viewport.selected_drawing_id = 0;
-                                    persist_drawings(app);
-                                } else if (res == 1) {
-                                    if (dr->kind > TOOL_CURSOR && dr->kind <= TOOL_TEXT) {
-                                        DrawingStyleDefaults* style = &app->drawing_defaults[dr->kind];
-                                        style->color = dr->argb_color;
-                                        style->width = dr->stroke_width;
-                                        style->line_style = dr->line_style;
-                                        style->align_h = dr->label_align_h;
-                                        style->align_v = dr->label_align_v;
-                                        ov_wcscpy(style->label, 64, dr->label);
-                                        app->viewport.drawing_color = dr->argb_color;
-                                    }
-                                    persist_drawings(app);
-                                }
-                                InvalidateRect(hwnd, NULL, FALSE);
-                            }
+                            edit_drawing(app, hwnd, hit_id);
                             return 0;
                         }
                     }
@@ -1289,37 +1542,42 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     }
                     if (app->viewport.wl_drag_active) {
                         const UILayoutCache* L = &app->renderer.layout;
-                        WatchlistItem wl[MAX_WATCHLIST];
-                        size_t wn = feed_manager_copy_watchlist(&app->feed, wl, MAX_WATCHLIST);
-                        bool matched_row = false;
-                        for (size_t i = 0; i < L->wl_visible_count; i++) {
-                            if (y_dip >= L->wl_rows[i].top - 2.0f && y_dip <= L->wl_rows[i].bottom + 2.0f) {
-                                size_t wi = L->wl_indices[i];
-                                app->viewport.wl_drop_entry_id = L->wl_entry_ids[i];
-                                app->viewport.wl_drop_after    = (y_dip > (L->wl_rows[i].top + L->wl_rows[i].bottom) * 0.5f);
-                                if (wi < wn) {
-                                    app->viewport.wl_drop_section_id = wl[wi].section_id;
-                                }
-                                matched_row = true;
-                                break;
-                            }
-                        }
-                        if (!matched_row) {
-                            for (size_t s = 0; s < L->wl_sec_visible_count; s++) {
-                                if (y_dip >= L->wl_sec_blocks[s].top && y_dip <= L->wl_sec_blocks[s].bottom) {
-                                    app->viewport.wl_drop_section_id = L->wl_sec_ids[s];
-                                    app->viewport.wl_drop_entry_id   = 0;
+                        if (!pt_in(L->wl_list_rect, x_dip, y_dip)) {
+                            app->viewport.wl_drop_entry_id = 0;
+                            app->viewport.wl_drop_section_id = 0;
+                        } else {
+                            WatchlistItem wl[MAX_WATCHLIST];
+                            size_t wn = feed_manager_copy_watchlist(&app->feed, wl, MAX_WATCHLIST);
+                            bool matched_row = false;
+                            for (size_t i = 0; i < L->wl_visible_count; i++) {
+                                if (y_dip >= L->wl_rows[i].top - 2.0f && y_dip <= L->wl_rows[i].bottom + 2.0f) {
+                                    size_t wi = L->wl_indices[i];
+                                    app->viewport.wl_drop_entry_id = L->wl_entry_ids[i];
+                                    app->viewport.wl_drop_after    = (y_dip > (L->wl_rows[i].top + L->wl_rows[i].bottom) * 0.5f);
+                                    if (wi < wn) {
+                                        app->viewport.wl_drop_section_id = wl[wi].section_id;
+                                    }
                                     matched_row = true;
                                     break;
                                 }
                             }
-                            if (!matched_row && L->wl_sec_visible_count > 0) {
-                                if (y_dip < L->wl_sec_blocks[0].top) {
-                                    app->viewport.wl_drop_section_id = L->wl_sec_ids[0];
-                                    app->viewport.wl_drop_entry_id   = 0;
-                                } else {
-                                    app->viewport.wl_drop_section_id = L->wl_sec_ids[L->wl_sec_visible_count - 1];
-                                    app->viewport.wl_drop_entry_id   = 0;
+                            if (!matched_row) {
+                                for (size_t s = 0; s < L->wl_sec_visible_count; s++) {
+                                    if (y_dip >= L->wl_sec_blocks[s].top && y_dip <= L->wl_sec_blocks[s].bottom) {
+                                        app->viewport.wl_drop_section_id = L->wl_sec_ids[s];
+                                        app->viewport.wl_drop_entry_id   = 0;
+                                        matched_row = true;
+                                        break;
+                                    }
+                                }
+                                if (!matched_row && L->wl_sec_visible_count > 0) {
+                                    if (y_dip < L->wl_sec_blocks[0].top) {
+                                        app->viewport.wl_drop_section_id = L->wl_sec_ids[0];
+                                        app->viewport.wl_drop_entry_id   = 0;
+                                    } else {
+                                        app->viewport.wl_drop_section_id = L->wl_sec_ids[L->wl_sec_visible_count - 1];
+                                        app->viewport.wl_drop_entry_id   = 0;
+                                    }
                                 }
                             }
                         }
@@ -1332,22 +1590,26 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     }
                     if (app->viewport.wl_drag_active) {
                         const UILayoutCache* L = &app->renderer.layout;
-                        bool matched_sec = false;
-                        for (size_t s = 0; s < L->wl_sec_visible_count; s++) {
-                            if (y_dip >= L->wl_sec_blocks[s].top && y_dip <= L->wl_sec_blocks[s].bottom) {
-                                app->viewport.wl_drop_section_id = L->wl_sec_ids[s];
-                                app->viewport.wl_drop_after = (y_dip > (L->wl_sec_blocks[s].top + L->wl_sec_blocks[s].bottom) * 0.5f);
-                                matched_sec = true;
-                                break;
+                        if (!pt_in(L->wl_list_rect, x_dip, y_dip)) {
+                            app->viewport.wl_drop_section_id = 0;
+                        } else {
+                            bool matched_sec = false;
+                            for (size_t s = 0; s < L->wl_sec_visible_count; s++) {
+                                if (y_dip >= L->wl_sec_blocks[s].top && y_dip <= L->wl_sec_blocks[s].bottom) {
+                                    app->viewport.wl_drop_section_id = L->wl_sec_ids[s];
+                                    app->viewport.wl_drop_after = (y_dip > (L->wl_sec_blocks[s].top + L->wl_sec_blocks[s].bottom) * 0.5f);
+                                    matched_sec = true;
+                                    break;
+                                }
                             }
-                        }
-                        if (!matched_sec && L->wl_sec_visible_count > 0) {
-                            if (y_dip < L->wl_sec_blocks[0].top) {
-                                app->viewport.wl_drop_section_id = L->wl_sec_ids[0];
-                                app->viewport.wl_drop_after      = false;
-                            } else {
-                                app->viewport.wl_drop_section_id = L->wl_sec_ids[L->wl_sec_visible_count - 1];
-                                app->viewport.wl_drop_after      = true;
+                            if (!matched_sec && L->wl_sec_visible_count > 0) {
+                                if (y_dip < L->wl_sec_blocks[0].top) {
+                                    app->viewport.wl_drop_section_id = L->wl_sec_ids[0];
+                                    app->viewport.wl_drop_after      = false;
+                                } else {
+                                    app->viewport.wl_drop_section_id = L->wl_sec_ids[L->wl_sec_visible_count - 1];
+                                    app->viewport.wl_drop_after      = true;
+                                }
                             }
                         }
                     }
@@ -1359,6 +1621,30 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_MOUSEWHEEL:
             if (app) {
                 short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                POINT wheel_pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                ScreenToClient(hwnd, &wheel_pt);
+                float dpi = get_dpi_scale(hwnd);
+                float x_dip = (float)wheel_pt.x / dpi;
+                float y_dip = (float)wheel_pt.y / dpi;
+                const UILayoutCache* L = &app->renderer.layout;
+                if (app->viewport.active_tab == TAB_WATCHLIST &&
+                    pt_in(L->wl_list_rect, x_dip, y_dip)) {
+                    app->viewport.wl_wheel_remainder += delta;
+                    int notches = app->viewport.wl_wheel_remainder / WHEEL_DELTA;
+                    app->viewport.wl_wheel_remainder -= notches * WHEEL_DELTA;
+                    if (notches != 0) {
+                        float old_scroll = app->viewport.wl_scroll;
+                        app->viewport.wl_scroll -= (float)notches * 132.0f;
+                        if (app->viewport.wl_scroll < 0.0f) app->viewport.wl_scroll = 0.0f;
+                        if (app->viewport.wl_scroll > L->wl_scroll_max) {
+                            app->viewport.wl_scroll = L->wl_scroll_max;
+                        }
+                        if (old_scroll != app->viewport.wl_scroll) {
+                            InvalidateRect(hwnd, NULL, FALSE);
+                        }
+                    }
+                    return 0;
+                }
                 app->viewport.bar_width += (delta > 0) ? 1.5f : -1.5f;
                 if (app->viewport.bar_width < 3.5f)  app->viewport.bar_width = 3.5f;
                 if (app->viewport.bar_width > 48.0f) app->viewport.bar_width = 48.0f;
@@ -1407,7 +1693,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     };
                     feed_manager_set_timeframe(&app->feed, kTfs[wParam - '1']);
                     app->viewport.last_primary_tick_ms = 0;
-                    persist_settings(kTfs[wParam - '1'], app->feed.primary_source, &app->ind_cfg);
+                    persist_settings(
+                        kTfs[wParam - '1'], app->feed.primary_source, &app->ind_cfg,
+                        app->drawing_defaults
+                    );
                     refresh_analytics(app, hwnd);
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
@@ -1431,6 +1720,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     bars, bn, &app->ind_cfg, &app->ind_buf,
                     secs, sn, wl, wn, srcs, &app->drawings, &app->alerts, &app->viewport
                 );
+                if (app->viewport.active_tab == TAB_WATCHLIST &&
+                    app->viewport.wl_scroll > app->renderer.layout.wl_scroll_max) {
+                    app->viewport.wl_scroll = app->renderer.layout.wl_scroll_max;
+                    app->viewport.wl_wheel_remainder = 0;
+                }
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -1439,6 +1733,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_DESTROY:
             if (app) {
                 KillTimer(hwnd, ID_TOAST_TIMER);
+                persist_settings(
+                    app->feed.timeframe, app->feed.primary_source, &app->ind_cfg,
+                    app->drawing_defaults
+                );
                 persist_drawings(app);
                 feed_manager_shutdown(&app->feed);
                 d2d_renderer_destroy(&app->renderer);
