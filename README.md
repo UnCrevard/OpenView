@@ -32,13 +32,6 @@ make
 
 The output is `OpenView.exe`.
 
-### With CMake and Visual Studio 2022
-
-```bat
-cmake -S C -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
-
 ## Technologies
 
 - C11 and the Win32 API
