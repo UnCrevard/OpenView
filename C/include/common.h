@@ -34,8 +34,32 @@ static inline void ov_wcscpy(wchar_t* dst, size_t cap, const wchar_t* src) {
     dst[cap - 1] = L'\0';
 }
 
+static inline bool ov_state_path(wchar_t* out, size_t cap, const wchar_t* filename) {
+    if (!out || cap == 0 || !filename) return false;
+    DWORD dir_len = GetCurrentDirectoryW((DWORD)cap, out);
+    if (dir_len == 0 || dir_len >= cap) {
+        dir_len = GetModuleFileNameW(NULL, out, (DWORD)cap);
+        if (dir_len == 0 || dir_len >= cap) {
+            ov_wcscpy(out, cap, L".");
+        } else {
+            wchar_t* slash = wcsrchr(out, L'\\');
+            if (slash) *slash = L'\0';
+        }
+    }
+    size_t used = wcslen(out);
+    if (used + 1 >= cap) return false;
+    if (used > 0 && out[used - 1] != L'\\' && out[used - 1] != L'/') {
+        out[used++] = L'\\';
+        out[used] = L'\0';
+    }
+    if (used + wcslen(filename) >= cap) return false;
+    wcscat(out, filename);
+    return true;
+}
+
 #define MAX_CANDLES         2048
 #define MAX_WATCHLIST       64
+#define MAX_MARKET_OPTIONS  8192
 #define MAX_WL_SECTIONS     16
 #define MAX_DRAWINGS        256
 #define MAX_ALERTS          64
@@ -52,7 +76,9 @@ typedef enum {
     SRC_BINANCE  = 0,
     SRC_COINBASE = 1,
     SRC_KRAKEN   = 2,
-    SRC_COUNT    = 3
+    SRC_MEXC     = 3,
+    SRC_COINGECKO = 4,
+    SRC_COUNT    = 5
 } FeedSourceId;
 
 typedef enum {
@@ -89,6 +115,7 @@ typedef struct {
     wchar_t  symbol[24];
     wchar_t  name[48];
     wchar_t  display_name[48];
+    wchar_t  provider_id[96];
     double   price;
     double   open_24h;
     double   high_24h;
@@ -98,7 +125,14 @@ typedef struct {
     double   source_prices[SRC_COUNT];
     int64_t  last_update_ms;
     bool     removed;
+    bool     has_24h_data;
 } WatchlistItem;
+
+typedef struct {
+    wchar_t symbol[24];
+    wchar_t name[48];
+    wchar_t provider_id[96];
+} MarketOption;
 
 typedef struct {
     wchar_t      symbol[24];
@@ -112,7 +146,8 @@ typedef enum {
     STATE_OFFLINE = 0,
     STATE_SYNCING,
     STATE_LIVE,
-    STATE_FALLBACK
+    STATE_FALLBACK,
+    STATE_STATIC
 } SourceConnState;
 
 typedef struct {

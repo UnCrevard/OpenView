@@ -19,6 +19,7 @@ typedef struct {
     float           pan_bars;
     float           bar_width;
     float           y_scale_factor;
+    float           y_pan_factor;
     float           mouse_x;
     float           mouse_y;
     bool            mouse_inside;
@@ -32,6 +33,7 @@ typedef struct {
     bool            has_toast;
     AlertLogEntry   toast_entry;
     int64_t         toast_until_ms;
+    uint64_t        last_primary_tick_ms;
     int             wl_drag_kind;
     uint32_t        wl_drag_id;
     bool            wl_drag_active;
@@ -46,8 +48,6 @@ typedef struct {
     TimeframeSec tf_values[9];
     D2D1_RECT_F ind_btn;
     D2D1_RECT_F sources_btn;
-    D2D1_RECT_F export_csv_btn;
-    D2D1_RECT_F export_json_btn;
     D2D1_RECT_F theme_btn;
 
     D2D1_RECT_F tool_btns[7];

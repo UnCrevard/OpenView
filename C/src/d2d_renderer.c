@@ -606,14 +606,6 @@ void d2d_renderer_paint(
     draw_btn_box(r, L->theme_btn, col_surface, col_border, dark ? L"Clair" : L"Sombre", col_text, r->font_small);
     bx -= 72.0f;
 
-    L->export_json_btn = (D2D1_RECT_F){ bx - 62.0f, 10.0f, bx, 38.0f };
-    draw_btn_box(r, L->export_json_btn, col_accent, col_accent, L"JSON", 0xFFFFFFFFU, r->font_small);
-    bx -= 68.0f;
-
-    L->export_csv_btn = (D2D1_RECT_F){ bx - 62.0f, 10.0f, bx, 38.0f };
-    draw_btn_box(r, L->export_csv_btn, col_surface, col_border, L"CSV", col_text, r->font_small);
-    bx -= 70.0f;
-
     int ov_cnt = 0;
     for (int s = 0; s < SRC_COUNT; s++) {
         if (s != (int)feed->primary_source && feed->overlay_sources[s]) ov_cnt++;
@@ -632,6 +624,57 @@ void d2d_renderer_paint(
     L->ind_btn = (D2D1_RECT_F){ bx - 110.0f, 10.0f, bx, 38.0f };
     if (L->ind_btn.left > tx + 8.0f) {
         draw_btn_box(r, L->ind_btn, col_surface, col_border, ind_btn_lbl, col_text, r->font_small);
+    }
+
+    const uint64_t now_ms = GetTickCount64();
+    const bool graph_has_data = primary_count > 0;
+    const bool has_recent_tick =
+        vp->last_primary_tick_ms > 0 &&
+        now_ms >= vp->last_primary_tick_ms &&
+        now_ms - vp->last_primary_tick_ms < 5000;
+    const SourceStatusInfo* primary_status = &sources[feed->primary_source];
+    const bool pulse_on = graph_has_data && has_recent_tick && ((now_ms / 400) % 2 == 0);
+    uint32_t activity_color = col_muted;
+    const wchar_t* activity_label = L"EN ATTENTE";
+    if (!graph_has_data) {
+        activity_label = L"CHARGEMENT";
+    } else if (has_recent_tick && primary_status->state == STATE_LIVE) {
+        activity_color = col_bull;
+        activity_label = L"LIVE";
+    } else if (has_recent_tick && primary_status->state == STATE_FALLBACK) {
+        activity_color = col_ema1;
+        activity_label = L"RELAIS";
+    } else if (primary_status->state == STATE_STATIC) {
+        activity_color = col_accent;
+        activity_label = L"HISTORIQUE";
+    } else if (primary_status->state == STATE_LIVE) {
+        activity_color = col_bull;
+        activity_label = L"CONNECTÉ";
+    } else if (primary_status->state == STATE_FALLBACK) {
+        activity_color = col_ema1;
+        activity_label = L"SECOURS";
+    } else if (primary_status->state == STATE_OFFLINE) {
+        activity_color = col_bear;
+        activity_label = L"HORS LIGNE";
+    } else {
+        activity_color = col_ema1;
+        activity_label = L"SYNC";
+    }
+
+    const float activity_x = tx + 10.0f;
+    if (activity_x + 104.0f < L->ind_btn.left - 4.0f) {
+        D2D1_ELLIPSE activity_dot = {
+            { activity_x + 5.0f, 24.0f },
+            pulse_on ? 4.5f : 3.5f,
+            pulse_on ? 4.5f : 3.5f
+        };
+        set_brush_argb(r->brush_dyn, activity_color, pulse_on ? 1.0f : 0.45f);
+        ID2D1HwndRenderTarget_FillEllipse(r->target, &activity_dot, (ID2D1Brush*)r->brush_dyn);
+        draw_txt(
+            r, r->font_small, activity_label,
+            (D2D1_RECT_F){ activity_x + 14.0f, 12.0f, activity_x + 104.0f, 36.0f },
+            activity_color
+        );
     }
 
     /* =====================================================================
@@ -752,8 +795,9 @@ void d2d_renderer_paint(
         double span  = max_p - min_p;
         if (span < mid_p * 0.002) span = (mid_p > 0.0 ? mid_p * 0.002 : 1.0);
         double scaled = span * 1.18 * (double)(vp->y_scale_factor > 0.1f ? vp->y_scale_factor : 1.0f);
-        min_p = mid_p - scaled * 0.5;
-        max_p = mid_p + scaled * 0.5;
+        double y_shift = scaled * (double)vp->y_pan_factor;
+        min_p = mid_p - scaled * 0.5 + y_shift;
+        max_p = mid_p + scaled * 0.5 + y_shift;
 
         L->min_price  = min_p;
         L->max_price  = max_p;
@@ -831,7 +875,9 @@ void d2d_renderer_paint(
         }
 
         /* Multi-source overlay curves */
-        static const uint32_t kSrcColors[SRC_COUNT] = { 0xFFF59E0BU, 0xFF38BDF8U, 0xFFA855F7U };
+        static const uint32_t kSrcColors[SRC_COUNT] = {
+            0xFFF59E0BU, 0xFF38BDF8U, 0xFFA855F7U, 0xFF22C55EU, 0xFF14B8A6U
+        };
         for (int s = 0; s < SRC_COUNT; s++) {
             if (s == (int)feed->primary_source || !feed->overlay_sources[s]) continue;
             size_t scnt = feed->candle_counts[s];
@@ -1160,6 +1206,17 @@ void d2d_renderer_paint(
 
         #undef P2Y
         #undef I2X
+    } else {
+        D2D1_RECT_F loading_rc = {
+            c_left + (c_w - 240.0f) * 0.5f,
+            main_top + (main_h - 44.0f) * 0.5f,
+            c_left + (c_w + 240.0f) * 0.5f,
+            main_top + (main_h + 44.0f) * 0.5f
+        };
+        draw_btn_box(r, loading_rc, col_panel, col_border, NULL, 0, r->font_small);
+        wchar_t loading_text[96];
+        swprintf(loading_text, 96, L"Chargement du graphique : %ls...", feed->active_symbol);
+        draw_txt(r, r->font_small, loading_text, loading_rc, col_text);
     }
 
     /* =====================================================================
@@ -1236,13 +1293,20 @@ void d2d_renderer_paint(
                 bool sec_drop_inside = vp->wl_drag_active && vp->wl_drag_kind == 1 &&
                                        vp->wl_drop_section_id == sec->id && vp->wl_drop_entry_id == 0;
                 bool sec_dragging    = vp->wl_drag_active && vp->wl_drag_kind == 2 && vp->wl_drag_id == sec->id;
-                uint32_t sec_fill    = sec_drop_inside ? (dark ? 0xFF1F2B47U : 0xFFDBEAFEU) : col_surface;
-                uint32_t sec_border  = (sec_drop_inside || sec_dragging) ? col_accent : col_border;
+                uint32_t sec_fill    = sec_drop_inside
+                    ? (dark ? 0xFF1F2B47U : 0xFFDBEAFEU)
+                    : (dark ? 0xFF252F45U : 0xFFE9EFFCU);
+                uint32_t sec_border  = (sec_drop_inside || sec_dragging)
+                    ? col_accent
+                    : (dark ? 0xFF3B4D70U : 0xFFB8C8EAU);
 
                 draw_btn_box(r, L->wl_sec_headers[svi_cur], sec_fill, sec_border, NULL, 0, r->font_small);
                 wchar_t sec_hdr[72];
                 swprintf(sec_hdr, 72, L"⋮ %ls %ls (%zu)", sec->collapsed ? L"▸" : L"▾", sec->name, sec_cnt);
-                draw_txt(r, r->font_small, sec_hdr, (D2D1_RECT_F){ rx + 12.0f, sy_cur + 4.0f, w_dip - 58.0f, sy_cur + 22.0f }, sec_dragging ? col_muted : col_text);
+                D2D1_RECT_F sec_accent = { rx + 8.0f, sy_cur + 3.0f, rx + 11.0f, sy_cur + 21.0f };
+                set_brush_argb(r->brush_dyn, sec_dragging ? col_muted : col_accent, 1.0f);
+                ID2D1HwndRenderTarget_FillRectangle(r->target, &sec_accent, (ID2D1Brush*)r->brush_dyn);
+                draw_txt(r, r->font_ui_bold, sec_hdr, (D2D1_RECT_F){ rx + 16.0f, sy_cur + 3.0f, w_dip - 58.0f, sy_cur + 22.0f }, sec_dragging ? col_muted : col_bright);
                 draw_btn_box(r, L->wl_sec_rename_btns[svi_cur], 0, 0, L"✎", col_muted, r->font_small);
                 if (section_count > 1) {
                     draw_btn_box(r, L->wl_sec_del_btns[svi_cur], 0, 0, L"×", col_bear, r->font_small);
@@ -1302,10 +1366,14 @@ void d2d_renderer_paint(
 
                     wchar_t px_s[32], pct_s[32];
                     format_price_w(it->price, px_s, 32);
-                    swprintf(pct_s, 32, L"%+.2f%%", it->change_pct);
+                    if (it->has_24h_data) {
+                        swprintf(pct_s, 32, L"%+.2f%%", it->change_pct);
+                    } else {
+                        ov_wcscpy(pct_s, 32, L"—");
+                    }
                     IDWriteTextFormat_SetTextAlignment(r->font_mono, DWRITE_TEXT_ALIGNMENT_TRAILING);
                     draw_txt(r, r->font_mono, px_s,  (D2D1_RECT_F){ rx + 128.0f, sy_cur + 6.0f,  w_dip - 98.0f, sy_cur + 22.0f }, col_bright);
-                    draw_txt(r, r->font_mono, pct_s, (D2D1_RECT_F){ rx + 128.0f, sy_cur + 23.0f, w_dip - 98.0f, sy_cur + 39.0f }, it->change_pct >= 0.0 ? col_bull : col_bear);
+                    draw_txt(r, r->font_mono, pct_s, (D2D1_RECT_F){ rx + 128.0f, sy_cur + 23.0f, w_dip - 98.0f, sy_cur + 39.0f }, !it->has_24h_data ? col_muted : (it->change_pct >= 0.0 ? col_bull : col_bear));
                     IDWriteTextFormat_SetTextAlignment(r->font_mono, DWRITE_TEXT_ALIGNMENT_LEADING);
 
                     draw_btn_box(r, L->wl_rename_btns[vi], 0, col_border, L"✎", col_muted,  r->font_small);
@@ -1370,11 +1438,13 @@ void d2d_renderer_paint(
             const wchar_t* hdr_name = active_tok->display_name[0] ? active_tok->display_name : active_tok->symbol;
             swprintf(
                 det, 256,
-                L"%ls (%ls) · 24h\nOuv: %ls   Vol: %.0f\nHaut: %ls  Bas: %ls\nBIN %.2f · CB %.2f · KR %.2f",
+                L"%ls (%ls) · 24h\nOuv: %ls   Vol: %.0f\nHaut: %ls  Bas: %ls\nB %.2f C %.2f K %.2f M %.2f G %.2f",
                 hdr_name, active_tok->symbol, p_op, active_tok->volume_24h, p_hi, p_lo,
                 active_tok->source_prices[SRC_BINANCE],
                 active_tok->source_prices[SRC_COINBASE],
-                active_tok->source_prices[SRC_KRAKEN]
+                active_tok->source_prices[SRC_KRAKEN],
+                active_tok->source_prices[SRC_MEXC],
+                active_tok->source_prices[SRC_COINGECKO]
             );
             draw_txt(r, r->font_mono, det, (D2D1_RECT_F){ det_rc.left + 10.0f, det_rc.top + 8.0f, det_rc.right - 8.0f, det_rc.bottom - 6.0f }, col_text);
         }
@@ -1431,8 +1501,15 @@ void d2d_renderer_paint(
             D2D1_RECT_F card = { rx + 10.0f, sy_cur, w_dip - 10.0f, sy_cur + 94.0f };
             draw_btn_box(r, card, col_surface, col_border, NULL, 0, r->font_small);
 
-            const wchar_t* st_txt = (src->state == STATE_LIVE) ? L"Flux réel" : ((src->state == STATE_SYNCING) ? L"Sync" : L"Relais sync");
-            uint32_t st_col = (src->state == STATE_LIVE) ? col_bull : col_ema1;
+            const wchar_t* st_txt =
+                src->state == STATE_LIVE ? L"Flux réel" :
+                src->state == STATE_STATIC ? L"Historique" :
+                src->state == STATE_SYNCING ? L"Sync" :
+                src->state == STATE_OFFLINE ? L"Hors ligne" : L"Relais sync";
+            uint32_t st_col =
+                src->state == STATE_LIVE ? col_bull :
+                src->state == STATE_STATIC ? col_accent :
+                src->state == STATE_OFFLINE ? col_bear : col_ema1;
             draw_txt(r, r->font_ui_bold, src->label, (D2D1_RECT_F){ card.left + 10.0f, sy_cur + 8.0f, card.left + 140.0f, sy_cur + 28.0f }, col_bright);
             draw_txt(r, r->font_small, st_txt, (D2D1_RECT_F){ w_dip - 105.0f, sy_cur + 10.0f, w_dip - 18.0f, sy_cur + 28.0f }, st_col);
 
@@ -1468,7 +1545,7 @@ void d2d_renderer_paint(
     }
 
     HRESULT hr = ID2D1HwndRenderTarget_EndDraw(r->target, NULL, NULL);
-    if (hr == D2DERR_RECREATE_TARGET) {
+    if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
         discard_device_resources(r);
     }
 }

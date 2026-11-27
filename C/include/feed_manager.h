@@ -20,8 +20,11 @@ typedef struct {
     HANDLE             rest_thread;
     TickRingBuffer     ring;
     SRWLOCK            data_lock;
+    SRWLOCK            market_lock;
     CandleBar          candles[SRC_COUNT][MAX_CANDLES];
     size_t             candle_counts[SRC_COUNT];
+    MarketOption*      market_cache[SRC_COUNT];
+    size_t             market_cache_counts[SRC_COUNT];
     WatchlistSection   sections[MAX_WL_SECTIONS];
     size_t             section_count;
     uint32_t           next_section_id;
@@ -31,6 +34,7 @@ typedef struct {
     uint32_t           active_entry_id;
     SourceStatusInfo   sources[SRC_COUNT];
     wchar_t            active_symbol[24];
+    wchar_t            active_provider_id[96];
     FeedSourceId       primary_source;
     TimeframeSec       timeframe;
     bool               overlay_sources[SRC_COUNT];
@@ -44,7 +48,13 @@ void feed_manager_set_timeframe(AsyncFeedManager* mgr, TimeframeSec tf);
 void feed_manager_set_primary_source(AsyncFeedManager* mgr, FeedSourceId src);
 void feed_manager_toggle_overlay(AsyncFeedManager* mgr, FeedSourceId src);
 
-bool feed_manager_add_token(AsyncFeedManager* mgr, const wchar_t* symbol, const wchar_t* name, uint32_t section_id);
+bool feed_manager_add_token(
+    AsyncFeedManager* mgr,
+    const wchar_t* symbol,
+    const wchar_t* name,
+    const wchar_t* provider_id,
+    uint32_t section_id
+);
 bool feed_manager_clone_entry(AsyncFeedManager* mgr, uint32_t entry_id);
 void feed_manager_rename_entry(AsyncFeedManager* mgr, uint32_t entry_id, const wchar_t* display_name);
 void feed_manager_move_entry(AsyncFeedManager* mgr, uint32_t entry_id, uint32_t target_section_id);
@@ -95,5 +105,28 @@ void feed_manager_copy_sources(
     AsyncFeedManager* mgr,
     SourceStatusInfo out_sources[SRC_COUNT]
 );
+
+bool feed_manager_load_watchlist_file_w(
+    AsyncFeedManager* mgr,
+    const wchar_t* file_path
+);
+size_t feed_manager_fetch_markets(
+    FeedSourceId source,
+    MarketOption* out_markets,
+    size_t max_markets
+);
+bool feed_manager_search_coingecko(
+    const wchar_t* query,
+    MarketOption* out_markets,
+    size_t max_markets,
+    size_t* out_count
+);
+size_t feed_manager_copy_market_cache(
+    AsyncFeedManager* mgr,
+    FeedSourceId source,
+    MarketOption* out_markets,
+    size_t max_markets
+);
+bool feed_manager_refresh_market_cache(AsyncFeedManager* mgr, FeedSourceId source);
 
 #endif /* OV_FEED_MANAGER_H */

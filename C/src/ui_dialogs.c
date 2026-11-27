@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wctype.h>
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -740,6 +741,228 @@ int ui_show_drawing_dialog(HWND parent, ChartDrawing* drawing, bool dark_theme) 
     if (!dlg) return 0;
     run_modal_loop(parent, dlg);
     return st.result;
+}
+
+typedef struct {
+    bool        dark_theme;
+    DlgThemeCtx theme;
+    HFONT       font;
+    HWND        filter;
+    HWND        list;
+    AsyncFeedManager* feed;
+    FeedSourceId source;
+    MarketOption* markets;
+    size_t      market_capacity;
+    size_t      market_count;
+    bool        coingecko_results;
+    HWND        status;
+    AddTokenCallback on_add;
+    void*       callback_context;
+} AddTokenDlgState;
+
+static bool token_catalog_matches(const MarketOption* item, const wchar_t* filter) {
+    if (!filter || !filter[0]) return true;
+    wchar_t name[64], symbol[32], query[64];
+    ov_wcscpy(name, 64, item->name);
+    ov_wcscpy(symbol, 32, item->symbol);
+    ov_wcscpy(query, 64, filter);
+    for (wchar_t* p = name; *p; p++) *p = (wchar_t)towlower((wint_t)*p);
+    for (wchar_t* p = symbol; *p; p++) *p = (wchar_t)towlower((wint_t)*p);
+    for (wchar_t* p = query; *p; p++) *p = (wchar_t)towlower((wint_t)*p);
+    return wcsstr(name, query) != NULL || wcsstr(symbol, query) != NULL;
+}
+
+static void add_token_dialog_refresh(AddTokenDlgState* st) {
+    wchar_t filter[64] = L"";
+    GetWindowTextW(st->filter, filter, 64);
+    SendMessageW(st->list, LB_RESETCONTENT, 0, 0);
+
+    for (size_t i = 0; i < st->market_count; i++) {
+        if (!token_catalog_matches(&st->markets[i], filter)) continue;
+        wchar_t label[96];
+        swprintf(label, 96, L"%ls  (%ls)", st->markets[i].name, st->markets[i].symbol);
+        LRESULT row = SendMessageW(st->list, LB_ADDSTRING, 0, (LPARAM)label);
+        if (row != LB_ERR && row != LB_ERRSPACE) {
+            SendMessageW(st->list, LB_SETITEMDATA, (WPARAM)row, (LPARAM)i);
+        }
+    }
+    if (SendMessageW(st->list, LB_GETCOUNT, 0, 0) > 0) {
+        SendMessageW(st->list, LB_SETCURSEL, 0, 0);
+    }
+}
+
+static void add_token_dialog_add_selected(AddTokenDlgState* st) {
+    LRESULT row = SendMessageW(st->list, LB_GETCURSEL, 0, 0);
+    if (row == LB_ERR) {
+        SetWindowTextW(st->status, L"Sélectionnez un marché à ajouter.");
+        return;
+    }
+
+    LRESULT index = SendMessageW(st->list, LB_GETITEMDATA, (WPARAM)row, 0);
+    if (index < 0 || (size_t)index >= st->market_count) {
+        SetWindowTextW(st->status, L"Le marché sélectionné n'est plus disponible.");
+        return;
+    }
+
+    const MarketOption* market = &st->markets[index];
+    if (!st->on_add ||
+        !st->on_add(st->callback_context, market->symbol, market->name, market->provider_id)) {
+        SetWindowTextW(st->status, L"Impossible d'ajouter ce token.");
+        return;
+    }
+
+    wchar_t message[96];
+    swprintf(message, 96, L"Ajouté : %ls", market->symbol);
+    SetWindowTextW(st->status, message);
+    SendMessageW(st->list, LB_SETCURSEL, (WPARAM)-1, 0);
+}
+
+static LRESULT CALLBACK AddTokenDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    AddTokenDlgState* st = (AddTokenDlgState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    LRESULT tres = 0;
+    if (st && dlg_theme_handle_msg(hwnd, msg, wParam, lParam, &st->theme, &tres)) {
+        return tres;
+    }
+
+    switch (msg) {
+        case WM_CREATE: {
+            CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+            st = (AddTokenDlgState*)cs->lpCreateParams;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+            dlg_theme_init(&st->theme, hwnd, st->dark_theme);
+            st->font = create_ui_font(14, false);
+
+            CreateWindowW(L"STATIC", L"Filtrer par nom ou symbole :", WS_CHILD | WS_VISIBLE,
+                          16, 14, 320, 20, hwnd, NULL, NULL, NULL);
+            st->filter = CreateWindowW(L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                16, 38, 244, 25, hwnd, (HMENU)501, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"CoinGecko",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                268, 38, 90, 25, hwnd, (HMENU)505, NULL, NULL);
+            st->list = CreateWindowW(L"LISTBOX", NULL,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_TABSTOP |
+                LBS_NOTIFY | LBS_HASSTRINGS,
+                16, 72, 342, 260, hwnd, (HMENU)502, NULL, NULL);
+            st->status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                       16, 336, 342, 18, hwnd, (HMENU)504, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"+ Ajouter", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                          68, 360, 92, 30, hwnd, (HMENU)IDOK, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"Recharger", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                          166, 360, 96, 30, hwnd, (HMENU)503, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"Annuler", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                          268, 360, 90, 30, hwnd, (HMENU)IDCANCEL, NULL, NULL);
+
+            dlg_theme_apply_children(hwnd, &st->theme, st->font);
+            add_token_dialog_refresh(st);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (!st) break;
+            if (LOWORD(wParam) == 501 && HIWORD(wParam) == EN_CHANGE) {
+                add_token_dialog_refresh(st);
+                if (st->coingecko_results) {
+                    SetWindowTextW(st->status, L"Cliquez sur CoinGecko pour rechercher cette saisie.");
+                }
+                return 0;
+            }
+            if (LOWORD(wParam) == 505) {
+                wchar_t query[96] = L"";
+                GetWindowTextW(st->filter, query, 96);
+                size_t result_count = 0;
+                if (feed_manager_search_coingecko(
+                        query, st->markets, st->market_capacity, &result_count)) {
+                    st->market_count = result_count;
+                    st->coingecko_results = true;
+                    add_token_dialog_refresh(st);
+                    wchar_t status[96];
+                    swprintf(status, 96, L"%zu résultat(s) CoinGecko.", result_count);
+                    SetWindowTextW(st->status, status);
+                } else {
+                    SetWindowTextW(st->status, L"Recherche CoinGecko impossible. Vérifiez la connexion.");
+                }
+                return 0;
+            }
+            if (LOWORD(wParam) == 503) {
+                if (feed_manager_refresh_market_cache(st->feed, st->source)) {
+                    st->market_count = feed_manager_copy_market_cache(
+                        st->feed, st->source, st->markets, st->market_capacity
+                    );
+                    st->coingecko_results = false;
+                    add_token_dialog_refresh(st);
+                } else {
+                    MessageBoxW(hwnd,
+                                L"Impossible de recharger les marchés. Vérifiez la connexion puis réessayez.",
+                                L"Recharger les marchés", MB_OK | MB_ICONWARNING);
+                }
+                return 0;
+            }
+            if (LOWORD(wParam) == IDOK ||
+                (LOWORD(wParam) == 502 && HIWORD(wParam) == LBN_DBLCLK)) {
+                add_token_dialog_add_selected(st);
+                return 0;
+            }
+            if (LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (st) {
+                if (st->font) DeleteObject(st->font);
+                dlg_theme_destroy(&st->theme);
+            }
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ui_show_add_token_dialog(
+    HWND parent,
+    AsyncFeedManager* feed,
+    FeedSourceId source,
+    MarketOption* markets,
+    size_t market_count,
+    AddTokenCallback on_add,
+    void* callback_context,
+    bool dark_theme
+) {
+    static bool registered = false;
+    const wchar_t* cls = L"OpenViewAddTokenDlgClass";
+    if (!registered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = AddTokenDlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = cls;
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    AddTokenDlgState st = {
+        .dark_theme = dark_theme,
+        .feed = feed,
+        .source = source,
+        .markets = markets,
+        .market_capacity = MAX_MARKET_OPTIONS,
+        .market_count = market_count,
+        .on_add = on_add,
+        .callback_context = callback_context
+    };
+    RECT pr;
+    GetWindowRect(parent, &pr);
+    const int width = 390, height = 430;
+    int x = pr.left + ((pr.right - pr.left) - width) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - height) / 2;
+    HWND dlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, cls, L"Ajouter un token",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, width, height,
+        parent, NULL, GetModuleHandleW(NULL), &st
+    );
+    if (!dlg) return;
+    run_modal_loop(parent, dlg);
 }
 
 /* =========================================================================

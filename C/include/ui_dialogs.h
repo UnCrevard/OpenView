@@ -5,6 +5,7 @@
 #include "indicators.h"
 #include "drawings.h"
 #include "alerts.h"
+#include "feed_manager.h"
 
 bool ui_show_indicators_dialog(HWND parent, IndicatorSettings* cfg, bool dark_theme);
 
@@ -18,6 +19,24 @@ bool ui_show_text_prompt(
     wchar_t* out_buf,
     size_t cap,
     bool allow_empty,
+    bool dark_theme
+);
+
+typedef bool (*AddTokenCallback)(
+    void* context,
+    const wchar_t* symbol,
+    const wchar_t* name,
+    const wchar_t* provider_id
+);
+
+void ui_show_add_token_dialog(
+    HWND parent,
+    AsyncFeedManager* feed,
+    FeedSourceId source,
+    MarketOption* markets,
+    size_t market_count,
+    AddTokenCallback on_add,
+    void* callback_context,
     bool dark_theme
 );
 

@@ -25,6 +25,7 @@ static bool read_metric(
             double lo = token_info->source_prices[0];
             double hi = token_info->source_prices[0];
             for (int s = 1; s < SRC_COUNT; s++) {
+                if (s == SRC_COINGECKO) continue;
                 double p = token_info->source_prices[s];
                 if (p <= 0.0) continue;
                 if (lo <= 0.0 || p < lo) lo = p;

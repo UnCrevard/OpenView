@@ -11,11 +11,141 @@ static void wcs_to_utf8(const wchar_t* w, char* out, int out_cap) {
     WideCharToMultiByte(CP_UTF8, 0, w ? w : L"", -1, out, out_cap, NULL, NULL);
 }
 
+static void write_json_string(HANDLE h, const wchar_t* w) {
+    char utf8[256];
+    wcs_to_utf8(w, utf8, sizeof(utf8));
+    write_str(h, "\"");
+    for (char* p = utf8; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (*p == '"' || *p == '\\') {
+            char esc[3] = { '\\', *p, '\0' };
+            write_str(h, esc);
+        } else if (c < 0x20) {
+            char esc[7];
+            snprintf(esc, sizeof(esc), "\\u%04X", c);
+            write_str(h, esc);
+        } else {
+            DWORD written = 0;
+            WriteFile(h, p, 1, &written, NULL);
+        }
+    }
+    write_str(h, "\"");
+}
+
+bool export_watchlist_state_json_w(
+    const wchar_t* file_path,
+    const WatchlistSection* sections,
+    size_t section_count,
+    const WatchlistItem* watchlist,
+    size_t watchlist_count,
+    const DrawingStore* drawings
+) {
+    HANDLE h = CreateFileW(
+        file_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    char buf[512];
+    write_str(h, "{\n  \"sections\": [\n");
+    for (size_t i = 0; i < section_count; i++) {
+        write_str(h, "    {\"id\": ");
+        snprintf(buf, sizeof(buf), "%u, \"name\": ", (unsigned)sections[i].id);
+        write_str(h, buf);
+        write_json_string(h, sections[i].name);
+        snprintf(
+            buf, sizeof(buf),
+            ", \"collapsed\": %s}%s\n",
+            sections[i].collapsed ? "true" : "false",
+            (i + 1 < section_count) ? "," : ""
+        );
+        write_str(h, buf);
+    }
+
+    write_str(h, "  ],\n  \"tokens\": [\n");
+    bool first_token = true;
+    for (size_t i = 0; i < watchlist_count; i++) {
+        if (watchlist[i].removed) continue;
+        if (!first_token) write_str(h, ",\n");
+        first_token = false;
+
+        write_str(h, "    {\"id\": ");
+        snprintf(
+            buf, sizeof(buf),
+            "%u, \"sectionId\": %u, \"symbol\": ",
+            (unsigned)watchlist[i].id,
+            (unsigned)watchlist[i].section_id
+        );
+        write_str(h, buf);
+        write_json_string(h, watchlist[i].symbol);
+        write_str(h, ", \"name\": ");
+        write_json_string(h, watchlist[i].name);
+        write_str(h, ", \"displayName\": ");
+        write_json_string(h, watchlist[i].display_name);
+        write_str(h, ", \"providerId\": ");
+        write_json_string(h, watchlist[i].provider_id);
+
+        write_str(h, ", \"drawings\": [");
+        bool first_drawing = true;
+        if (drawings) {
+            bool first_matching_token = true;
+            for (size_t j = 0; j < i; j++) {
+                if (!watchlist[j].removed &&
+                    wcscmp(watchlist[j].symbol, watchlist[i].symbol) == 0) {
+                    first_matching_token = false;
+                    break;
+                }
+            }
+            for (size_t d = 0; d < drawings->count; d++) {
+                const ChartDrawing* dr = &drawings->items[d];
+                bool belongs_to_entry = dr->entry_id == watchlist[i].id;
+                bool belongs_to_primary_symbol =
+                    dr->entry_id == 0 &&
+                    first_matching_token &&
+                    wcscmp(dr->symbol, watchlist[i].symbol) == 0;
+                if (!belongs_to_entry && !belongs_to_primary_symbol) continue;
+                if (!first_drawing) write_str(h, ", ");
+                first_drawing = false;
+
+                snprintf(
+                    buf, sizeof(buf),
+                    "{\"id\":%u,\"kind\":%d,\"color\":%u,\"width\":%.2f,\"style\":%d,"
+                    "\"locked\":%s,\"label\":",
+                    (unsigned)dr->id, (int)dr->kind, (unsigned)dr->argb_color,
+                    dr->stroke_width, (int)dr->line_style,
+                    dr->locked ? "true" : "false"
+                );
+                write_str(h, buf);
+                write_json_string(h, dr->label);
+                write_str(h, ",\"pts\":[");
+                for (size_t p = 0; p < dr->pt_count; p++) {
+                    snprintf(
+                        buf, sizeof(buf),
+                        "{\"t\":%lld,\"p\":%.8f}%s",
+                        (long long)dr->pts[p].time_utc,
+                        dr->pts[p].price,
+                        (p + 1 < dr->pt_count) ? "," : ""
+                    );
+                    write_str(h, buf);
+                }
+                write_str(h, "]");
+                write_str(h, "}");
+            }
+        }
+        write_str(h, "]}\n");
+    }
+    write_str(h, "  ]\n}\n");
+
+    CloseHandle(h);
+    return true;
+}
+
 static const char* source_name_utf8(FeedSourceId s) {
     switch (s) {
         case SRC_BINANCE:  return "binance";
         case SRC_COINBASE: return "coinbase";
         case SRC_KRAKEN:   return "kraken";
+        case SRC_MEXC:     return "mexc";
+        case SRC_COINGECKO: return "coingecko";
         default:           return "binance";
     }
 }

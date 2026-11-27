@@ -136,7 +136,7 @@ static char* winhttp_get_text(const wchar_t* host, const wchar_t* path, uint32_t
                 while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
                     if (len + avail + 1 > cap) {
                         size_t next_cap = cap * 2 + avail;
-                        if (next_cap > 2 * 1024 * 1024) break;
+                        if (next_cap > 8 * 1024 * 1024) break;
                         char* grown = (char*)realloc(result, next_cap);
                         if (!grown) break;
                         result = grown;
@@ -278,6 +278,572 @@ static size_t fetch_binance_candles(
     return count;
 }
 
+static size_t fetch_mexc_candles(
+    const wchar_t* symbol,
+    TimeframeSec tf,
+    CandleBar* out,
+    size_t max_out,
+    uint32_t* latency_ms
+) {
+    char base[16], quote[16];
+    split_symbol(symbol, base, sizeof(base), quote, sizeof(quote));
+
+    const wchar_t* iv = L"15m";
+    switch (tf) {
+        case TF_1M:  iv = L"1m"; break;
+        case TF_5M:  iv = L"5m"; break;
+        case TF_15M: iv = L"15m"; break;
+        case TF_1H:  iv = L"60m"; break;
+        case TF_4H:  iv = L"4h"; break;
+        case TF_1D:  iv = L"1d"; break;
+        case TF_1W:  iv = L"1W"; break;
+        case TF_1MO: iv = L"1M"; break;
+        case TF_1Y:  iv = L"1M"; break;
+    }
+
+    wchar_t wbase[16], wquote[16], path[192];
+    if (!MultiByteToWideChar(CP_UTF8, 0, base, -1, wbase, 16) ||
+        !MultiByteToWideChar(CP_UTF8, 0, quote, -1, wquote, 16)) {
+        return 0;
+    }
+    swprintf(path, 192, L"/api/v3/klines?symbol=%ls%ls&interval=%ls&limit=300",
+             wbase, wquote, iv);
+
+    char* body = winhttp_get_text(L"api.mexc.com", path, latency_ms);
+    if (!body) return 0;
+
+    size_t count = 0;
+    const char* p = body;
+    while (count < max_out && (p = strchr(p, '[')) != NULL) {
+        p++;
+        if (*p == '[' || *p == ']') continue;
+
+        char* end = NULL;
+        long long open_ms = strtoll(p, &end, 10);
+        if (end == p || open_ms <= 0) continue;
+        p = end;
+
+        double values[5];
+        bool valid = true;
+        for (size_t i = 0; i < 5; i++) {
+            while (*p == ' ' || *p == '\t' || *p == ',') p++;
+            if (*p == '"') p++;
+            values[i] = strtod(p, &end);
+            if (end == p) {
+                valid = false;
+                break;
+            }
+            p = end;
+            if (*p == '"') p++;
+        }
+        if (valid && values[3] > 0.0) {
+            out[count++] = (CandleBar){
+                .time_utc = (int64_t)(open_ms / 1000LL),
+                .open     = values[0],
+                .high     = values[1],
+                .low      = values[2],
+                .close    = values[3],
+                .volume   = values[4],
+                .source   = SRC_MEXC
+            };
+        }
+        const char* row_end = strchr(p, ']');
+        if (!row_end) break;
+        p = row_end + 1;
+    }
+    free(body);
+
+    if ((tf == TF_1W || tf == TF_1MO || tf == TF_1Y) && count > 0) {
+        count = aggregate_bars_in_place(out, count, tf, SRC_MEXC);
+    }
+    return count;
+}
+
+typedef struct {
+    double last_price;
+    double open_price;
+    double high_price;
+    double low_price;
+    double volume;
+    double change_pct;
+} BinanceTicker24h;
+
+static bool json_number(const char* json, const char* key, double* out_value) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* value = strstr(json, pattern);
+    if (!value) return false;
+    value += strlen(pattern);
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value == '"') value++;
+    char* end = NULL;
+    double parsed = strtod(value, &end);
+    if (end == value) return false;
+    *out_value = parsed;
+    return true;
+}
+
+static bool fetch_binance_ticker_24h(
+    const wchar_t* symbol,
+    BinanceTicker24h* out,
+    uint32_t* latency_ms
+) {
+    char base[16], quote[16];
+    split_symbol(symbol, base, sizeof(base), quote, sizeof(quote));
+    if (strcmp(quote, "USD") == 0) strcpy(quote, "USDT");
+
+    wchar_t wbase[16], wquote[16], path[128];
+    if (!MultiByteToWideChar(CP_UTF8, 0, base, -1, wbase, 16) ||
+        !MultiByteToWideChar(CP_UTF8, 0, quote, -1, wquote, 16)) {
+        return false;
+    }
+    swprintf(path, 128, L"/api/v3/ticker/24hr?symbol=%ls%ls", wbase, wquote);
+    char* body = winhttp_get_text(L"api.binance.com", path, latency_ms);
+    if (!body) return false;
+
+    bool ok =
+        json_number(body, "lastPrice", &out->last_price) &&
+        json_number(body, "openPrice", &out->open_price) &&
+        json_number(body, "highPrice", &out->high_price) &&
+        json_number(body, "lowPrice", &out->low_price) &&
+        json_number(body, "volume", &out->volume) &&
+        json_number(body, "priceChangePercent", &out->change_pct) &&
+        out->last_price > 0.0 && out->open_price > 0.0;
+    free(body);
+    return ok;
+}
+
+static bool fetch_mexc_ticker_24h(
+    const wchar_t* symbol,
+    BinanceTicker24h* out,
+    uint32_t* latency_ms
+) {
+    char base[16], quote[16];
+    split_symbol(symbol, base, sizeof(base), quote, sizeof(quote));
+    wchar_t wbase[16], wquote[16], path[128];
+    if (!MultiByteToWideChar(CP_UTF8, 0, base, -1, wbase, 16) ||
+        !MultiByteToWideChar(CP_UTF8, 0, quote, -1, wquote, 16)) {
+        return false;
+    }
+    swprintf(path, 128, L"/api/v3/ticker/24hr?symbol=%ls%ls", wbase, wquote);
+    char* body = winhttp_get_text(L"api.mexc.com", path, latency_ms);
+    if (!body) return false;
+
+    bool ok =
+        json_number(body, "lastPrice", &out->last_price) &&
+        json_number(body, "openPrice", &out->open_price) &&
+        json_number(body, "highPrice", &out->high_price) &&
+        json_number(body, "lowPrice", &out->low_price) &&
+        json_number(body, "volume", &out->volume) &&
+        json_number(body, "priceChangePercent", &out->change_pct) &&
+        out->last_price > 0.0 && out->open_price > 0.0;
+    if (ok) out->change_pct *= 100.0;
+    free(body);
+    return ok;
+}
+
+static double fetch_mexc_last_price(const wchar_t* symbol) {
+    char base[16], quote[16];
+    split_symbol(symbol, base, sizeof(base), quote, sizeof(quote));
+    wchar_t wbase[16], wquote[16], path[128];
+    if (!MultiByteToWideChar(CP_UTF8, 0, base, -1, wbase, 16) ||
+        !MultiByteToWideChar(CP_UTF8, 0, quote, -1, wquote, 16)) {
+        return 0.0;
+    }
+    swprintf(path, 128, L"/api/v3/ticker/price?symbol=%ls%ls", wbase, wquote);
+    char* body = winhttp_get_text(L"api.mexc.com", path, NULL);
+    if (!body) return 0.0;
+    double price = 0.0;
+    json_number(body, "price", &price);
+    free(body);
+    return price;
+}
+
+static const char* market_object_end(const char* start) {
+    int depth = 0;
+    bool quoted = false;
+    bool escaped = false;
+    for (const char* p = start; *p; p++) {
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (*p == '\\') escaped = true;
+            else if (*p == '"') quoted = false;
+            continue;
+        }
+        if (*p == '"') quoted = true;
+        else if (*p == '{') depth++;
+        else if (*p == '}' && --depth == 0) return p;
+    }
+    return NULL;
+}
+
+static bool market_json_string(
+    const char* object,
+    const char* key,
+    char* out,
+    size_t out_cap
+) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* value = strstr(object, pattern);
+    if (!value) return false;
+    value += strlen(pattern);
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value++ != '"') return false;
+
+    size_t used = 0;
+    while (*value && *value != '"' && used + 1 < out_cap) {
+        if (*value == '\\' && value[1]) value++;
+        out[used++] = *value++;
+    }
+    out[used] = '\0';
+    return *value == '"';
+}
+
+static bool market_json_is_true(const char* object, const char* key) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* value = strstr(object, pattern);
+    if (!value) return false;
+    value += strlen(pattern);
+    while (*value == ' ' || *value == '\t') value++;
+    return strncmp(value, "true", 4) == 0;
+}
+
+static bool market_is_online(const char* object) {
+    char status[32];
+    return !market_json_string(object, "status", status, sizeof(status)) ||
+           strcmp(status, "online") == 0 ||
+           strcmp(status, "TRADING") == 0;
+}
+
+static bool append_market_option(
+    MarketOption* out,
+    size_t max,
+    size_t* count,
+    const char* base,
+    const char* quote,
+    const char* name
+) {
+    if (*count >= max || !base[0] || !quote[0]) return false;
+    wchar_t wbase[24], wquote[12], wname[48];
+    if (!MultiByteToWideChar(CP_UTF8, 0, base, -1, wbase, 24) ||
+        !MultiByteToWideChar(CP_UTF8, 0, quote, -1, wquote, 12)) return false;
+    if (!name || !name[0]) name = base;
+    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 48)) {
+        ov_wcscpy(wname, 48, wbase);
+    }
+    MarketOption* item = &out[(*count)++];
+    swprintf(item->symbol, 24, L"%ls/%ls", wbase, wquote);
+    ov_wcscpy(item->name, 48, wname);
+    return true;
+}
+
+static size_t parse_array_markets(
+    const char* json,
+    const char* array_key,
+    FeedSourceId source,
+    MarketOption* out,
+    size_t max
+) {
+    const char* array = json;
+    if (array_key) {
+        char pattern[64];
+        snprintf(pattern, sizeof(pattern), "\"%s\":", array_key);
+        array = strstr(json, pattern);
+        if (!array) return 0;
+    }
+    array = strchr(array, '[');
+    if (!array) return 0;
+
+    size_t count = 0;
+    const char* cur = array + 1;
+    while (*cur && *cur != ']' && count < max) {
+        if (*cur != '{') {
+            cur++;
+            continue;
+        }
+        const char* end = market_object_end(cur);
+        if (!end) break;
+        size_t span = (size_t)(end - cur + 1);
+        char* object = (char*)malloc(span + 1);
+        if (!object) break;
+        memcpy(object, cur, span);
+        object[span] = '\0';
+
+        char base[32] = "", quote[16] = "", name[48] = "", status[32] = "";
+        bool is_online = market_is_online(object);
+        if (source == SRC_BINANCE || source == SRC_MEXC) {
+            market_json_string(object, "baseAsset", base, sizeof(base));
+            market_json_string(object, "quoteAsset", quote, sizeof(quote));
+            market_json_string(object, "status", status, sizeof(status));
+            bool active = source == SRC_BINANCE
+                ? strcmp(status, "TRADING") == 0
+                : ((strcmp(status, "1") == 0 || strcmp(status, "ENABLED") == 0) &&
+                   market_json_is_true(object, "isSpotTradingAllowed"));
+            if (active) {
+                if (source == SRC_MEXC) {
+                    market_json_string(object, "fullName", name, sizeof(name));
+                }
+                if (!name[0]) snprintf(name, sizeof(name), "%s", base);
+                append_market_option(out, max, &count, base, quote, name);
+            }
+        } else {
+            market_json_string(object, "base_currency", base, sizeof(base));
+            market_json_string(object, "quote_currency", quote, sizeof(quote));
+            market_json_string(object, "base_name", name, sizeof(name));
+            market_json_string(object, "status", status, sizeof(status));
+            bool disabled = strstr(object, "\"trading_disabled\":true") != NULL;
+            if (is_online && !disabled && strcmp(quote, "USD") == 0) {
+                append_market_option(out, max, &count, base, quote, name);
+            }
+        }
+
+        free(object);
+        cur = end + 1;
+    }
+    return count;
+}
+
+static size_t parse_kraken_markets(const char* json, MarketOption* out, size_t max) {
+    const char* result = strstr(json, "\"result\":");
+    const char* object = result ? strchr(result, '{') : NULL;
+    if (!object) return 0;
+    object++;
+    size_t count = 0;
+    while (*object && *object != '}' && count < max) {
+        if (*object != '"') {
+            object++;
+            continue;
+        }
+        const char* key_end = strchr(object + 1, '"');
+        if (!key_end) break;
+        const char* value = key_end + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        if (*value++ != ':') {
+            object = key_end + 1;
+            continue;
+        }
+        while (*value == ' ' || *value == '\t') value++;
+        if (*value != '{') {
+            object = value;
+            continue;
+        }
+
+        const char* end = market_object_end(value);
+        if (!end) break;
+        size_t span = (size_t)(end - value + 1);
+        char* pair = (char*)malloc(span + 1);
+        if (!pair) break;
+        memcpy(pair, value, span);
+        pair[span] = '\0';
+
+        char wsname[48] = "", status[32] = "";
+        market_json_string(pair, "wsname", wsname, sizeof(wsname));
+        market_json_string(pair, "status", status, sizeof(status));
+        if (wsname[0] && (!status[0] || strcmp(status, "online") == 0)) {
+            char* slash = strchr(wsname, '/');
+            if (slash && strcmp(slash + 1, "USD") == 0) {
+                *slash = '\0';
+                append_market_option(out, max, &count, wsname, "USD", wsname);
+            }
+        }
+        free(pair);
+        object = end + 1;
+    }
+    return count;
+}
+
+size_t feed_manager_fetch_markets(
+    FeedSourceId source,
+    MarketOption* out_markets,
+    size_t max_markets
+) {
+    if (!out_markets || max_markets == 0 || source < 0 || source >= SRC_COUNT) return 0;
+
+    const wchar_t* host;
+    const wchar_t* path;
+    switch (source) {
+        case SRC_BINANCE:
+            host = L"api.binance.com";
+            path = L"/api/v3/exchangeInfo";
+            break;
+        case SRC_COINBASE:
+            host = L"api.exchange.coinbase.com";
+            path = L"/products";
+            break;
+        case SRC_KRAKEN:
+            host = L"api.kraken.com";
+            path = L"/0/public/AssetPairs";
+            break;
+        case SRC_MEXC:
+            host = L"api.mexc.com";
+            path = L"/api/v3/exchangeInfo";
+            break;
+        default:
+            return 0;
+    }
+
+    char* body = winhttp_get_text(host, path, NULL);
+    if (!body) return 0;
+    size_t count = (source == SRC_KRAKEN)
+        ? parse_kraken_markets(body, out_markets, max_markets)
+        : parse_array_markets(
+            body,
+            (source == SRC_BINANCE || source == SRC_MEXC) ? "symbols" : NULL,
+            source,
+            out_markets,
+            max_markets
+        );
+    free(body);
+    return count;
+}
+
+static bool encode_coingecko_query(const wchar_t* query, wchar_t* out, size_t out_cap) {
+    char utf8[256];
+    if (!query || !query[0] ||
+        !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, query, -1, utf8, sizeof(utf8), NULL, NULL)) {
+        return false;
+    }
+
+    size_t used = 0;
+    for (const unsigned char* p = (const unsigned char*)utf8; *p; p++) {
+        bool unreserved = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                          (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+                          *p == '.' || *p == '~';
+        if (unreserved) {
+            if (used + 1 >= out_cap) return false;
+            out[used++] = (wchar_t)*p;
+        } else {
+            if (used + 3 >= out_cap) return false;
+            out[used++] = L'%';
+            out[used++] = L"0123456789ABCDEF"[*p >> 4];
+            out[used++] = L"0123456789ABCDEF"[*p & 0x0F];
+        }
+    }
+    out[used] = L'\0';
+    return used > 0;
+}
+
+bool feed_manager_search_coingecko(
+    const wchar_t* query,
+    MarketOption* out_markets,
+    size_t max_markets,
+    size_t* out_count
+) {
+    if (out_count) *out_count = 0;
+    if (!query || !out_markets || max_markets == 0 || !out_count) return false;
+
+    wchar_t encoded_query[768], path[832];
+    if (!encode_coingecko_query(query, encoded_query, sizeof(encoded_query) / sizeof(encoded_query[0]))) {
+        return false;
+    }
+    swprintf(path, sizeof(path) / sizeof(path[0]), L"/api/v3/search?query=%ls", encoded_query);
+    char* body = winhttp_get_text(L"api.coingecko.com", path, NULL);
+    if (!body) return false;
+
+    const char* coins = strstr(body, "\"coins\":");
+    const char* cur = coins ? strchr(coins, '[') : NULL;
+    if (!cur) {
+        free(body);
+        return false;
+    }
+
+    size_t count = 0;
+    bool parse_ok = true;
+    for (cur++; *cur && *cur != ']' && count < max_markets;) {
+        if (*cur != '{') {
+            cur++;
+            continue;
+        }
+        const char* end = market_object_end(cur);
+        if (!end) {
+            parse_ok = false;
+            break;
+        }
+
+        size_t span = (size_t)(end - cur + 1);
+        char* object = (char*)malloc(span + 1);
+        if (!object) {
+            parse_ok = false;
+            break;
+        }
+        memcpy(object, cur, span);
+        object[span] = '\0';
+
+        char id[96] = "", symbol[24] = "", name[96] = "";
+        if (market_json_string(object, "id", id, sizeof(id)) &&
+            market_json_string(object, "symbol", symbol, sizeof(symbol)) &&
+            market_json_string(object, "name", name, sizeof(name)) &&
+            id[0] && symbol[0]) {
+            wchar_t wid[96], wsymbol[24], wname[48];
+            for (char* p = symbol; *p; p++) {
+                if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
+            }
+            if (strlen(symbol) < 20 &&
+                MultiByteToWideChar(CP_UTF8, 0, id, -1, wid, 96) &&
+                MultiByteToWideChar(CP_UTF8, 0, symbol, -1, wsymbol, 24)) {
+                if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 48)) {
+                    ov_wcscpy(wname, 48, wsymbol);
+                }
+                MarketOption* item = &out_markets[count++];
+                ZeroMemory(item, sizeof(*item));
+                swprintf(item->symbol, 24, L"%ls/USD", wsymbol);
+                ov_wcscpy(item->name, 48, wname);
+                ov_wcscpy(item->provider_id, 96, wid);
+            }
+        }
+
+        free(object);
+        cur = end + 1;
+    }
+
+    free(body);
+    if (!parse_ok) return false;
+    *out_count = count;
+    return true;
+}
+
+size_t feed_manager_copy_market_cache(
+    AsyncFeedManager* mgr,
+    FeedSourceId source,
+    MarketOption* out_markets,
+    size_t max_markets
+) {
+    if (!mgr || !out_markets || max_markets == 0 || source < 0 || source >= SRC_COUNT) {
+        return 0;
+    }
+
+    AcquireSRWLockShared(&mgr->market_lock);
+    size_t count = mgr->market_cache_counts[source];
+    if (count > max_markets) count = max_markets;
+    if (count > 0) {
+        memcpy(out_markets, mgr->market_cache[source], count * sizeof(*out_markets));
+    }
+    ReleaseSRWLockShared(&mgr->market_lock);
+    return count;
+}
+
+bool feed_manager_refresh_market_cache(AsyncFeedManager* mgr, FeedSourceId source) {
+    if (!mgr || source < 0 || source >= SRC_COUNT) return false;
+
+    MarketOption* markets = (MarketOption*)calloc(MAX_MARKET_OPTIONS, sizeof(*markets));
+    if (!markets) return false;
+    size_t count = feed_manager_fetch_markets(source, markets, MAX_MARKET_OPTIONS);
+    if (count == 0) {
+        free(markets);
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&mgr->market_lock);
+    MarketOption* old_markets = mgr->market_cache[source];
+    mgr->market_cache[source] = markets;
+    mgr->market_cache_counts[source] = count;
+    ReleaseSRWLockExclusive(&mgr->market_lock);
+    free(old_markets);
+    return true;
+}
+
 static size_t fetch_coinbase_candles(
     const wchar_t* symbol,
     TimeframeSec tf,
@@ -396,12 +962,177 @@ static size_t fetch_kraken_candles(
     return count;
 }
 
+typedef struct {
+    int64_t timestamp_ms;
+    double value;
+} CoinGeckoPoint;
+
+static bool encode_coingecko_id(const wchar_t* id, wchar_t* out, size_t out_cap) {
+    char utf8[256];
+    if (!id || !id[0] ||
+        !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, id, -1, utf8, sizeof(utf8), NULL, NULL)) {
+        return false;
+    }
+
+    size_t used = 0;
+    for (const unsigned char* p = (const unsigned char*)utf8; *p; p++) {
+        bool unreserved = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                          (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+                          *p == '.' || *p == '~';
+        if (unreserved) {
+            if (used + 1 >= out_cap) return false;
+            out[used++] = (wchar_t)*p;
+        } else {
+            if (used + 3 >= out_cap) return false;
+            out[used++] = L'%';
+            out[used++] = L"0123456789ABCDEF"[*p >> 4];
+            out[used++] = L"0123456789ABCDEF"[*p & 0x0F];
+        }
+    }
+    out[used] = L'\0';
+    return used > 0;
+}
+
+static bool parse_coingecko_points(
+    const char* json,
+    const char* key,
+    CoinGeckoPoint* out,
+    size_t capacity,
+    size_t* out_count
+) {
+    *out_count = 0;
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* field = strstr(json, pattern);
+    const char* cur = field ? strchr(field, '[') : NULL;
+    if (!cur) return false;
+
+    for (cur++; *cur;) {
+        while (*cur == ' ' || *cur == '\t' || *cur == '\r' || *cur == '\n' || *cur == ',') cur++;
+        if (*cur == ']') return true;
+        if (*cur != '[' || *out_count >= capacity) return false;
+
+        char* end = NULL;
+        double timestamp = strtod(cur + 1, &end);
+        if (end == cur + 1) return false;
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end++ != ',') return false;
+        double value = strtod(end, &end);
+        if (!isfinite(timestamp) || !isfinite(value)) return false;
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end++ != ']') return false;
+
+        out[*out_count].timestamp_ms = (int64_t)timestamp;
+        out[*out_count].value = value;
+        (*out_count)++;
+        cur = end;
+    }
+    return false;
+}
+
+static size_t fetch_coingecko_candles(
+    const wchar_t* provider_id,
+    TimeframeSec tf,
+    CandleBar* out,
+    size_t max_out,
+    uint32_t* latency_ms
+) {
+    if (!provider_id || !provider_id[0] || !out || max_out == 0) return 0;
+
+    const wchar_t* days = L"1";
+    if (tf == TF_1H) days = L"7";
+    else if (tf == TF_4H) days = L"30";
+    else if (tf == TF_1D) days = L"90";
+    else if (tf == TF_1W || tf == TF_1MO) days = L"365";
+    else if (tf == TF_1Y) days = L"365";
+
+    wchar_t encoded_id[768], path[960];
+    if (!encode_coingecko_id(provider_id, encoded_id, sizeof(encoded_id) / sizeof(encoded_id[0]))) {
+        return 0;
+    }
+    swprintf(
+        path, sizeof(path) / sizeof(path[0]),
+        L"/api/v3/coins/%ls/market_chart?vs_currency=usd&days=%ls",
+        encoded_id, days
+    );
+
+    char* body = winhttp_get_text(L"api.coingecko.com", path, latency_ms);
+    if (!body) return 0;
+
+    const size_t max_points = 50000;
+    CoinGeckoPoint* prices = (CoinGeckoPoint*)malloc(max_points * sizeof(*prices));
+    CoinGeckoPoint* volumes = (CoinGeckoPoint*)malloc(max_points * sizeof(*volumes));
+    if (!prices || !volumes) {
+        free(prices);
+        free(volumes);
+        free(body);
+        return 0;
+    }
+
+    size_t price_count = 0, volume_count = 0;
+    bool parsed = parse_coingecko_points(body, "prices", prices, max_points, &price_count) &&
+                  parse_coingecko_points(body, "total_volumes", volumes, max_points, &volume_count);
+    free(body);
+    if (!parsed || price_count == 0) {
+        free(prices);
+        free(volumes);
+        return 0;
+    }
+
+    size_t count = 0;
+    for (size_t i = 0; i < price_count; i++) {
+        int64_t ts_sec = prices[i].timestamp_ms / 1000;
+        if (ts_sec <= 0 || prices[i].value <= 0.0) continue;
+        int64_t bar_time = feed_bucket_start_sec(ts_sec, tf);
+        double volume = i < volume_count && volumes[i].value > 0.0 ? volumes[i].value : 0.0;
+
+        if (count > 0 && out[count - 1].time_utc == bar_time) {
+            CandleBar* bar = &out[count - 1];
+            if (prices[i].value > bar->high) bar->high = prices[i].value;
+            if (prices[i].value < bar->low) bar->low = prices[i].value;
+            bar->close = prices[i].value;
+            bar->volume += volume;
+        } else {
+            if (count == max_out) {
+                memmove(out, out + 1, (max_out - 1) * sizeof(*out));
+                count--;
+            }
+            out[count++] = (CandleBar){
+                .time_utc = bar_time,
+                .open = prices[i].value,
+                .high = prices[i].value,
+                .low = prices[i].value,
+                .close = prices[i].value,
+                .volume = volume,
+                .source = SRC_COINGECKO
+            };
+        }
+    }
+
+    free(prices);
+    free(volumes);
+    return count;
+}
+
+static void clear_candle_cache_locked(AsyncFeedManager* mgr) {
+    for (int s = 0; s < SRC_COUNT; s++) {
+        mgr->candle_counts[s] = 0;
+        ZeroMemory(mgr->candles[s], sizeof(mgr->candles[s]));
+        mgr->sources[s].state = STATE_SYNCING;
+    }
+}
+
 static void build_seed_candles_locked(
     AsyncFeedManager* mgr,
     const wchar_t* symbol,
     TimeframeSec tf,
     FeedSourceId s
 ) {
+    if (s == SRC_COINGECKO) {
+        mgr->candle_counts[s] = 0;
+        return;
+    }
+
     double base_price = 100.0;
     for (size_t w = 0; w < mgr->watchlist_count; w++) {
         if (wcscmp(mgr->watchlist[w].symbol, symbol) == 0) {
@@ -423,7 +1154,8 @@ static void build_seed_candles_locked(
     uint32_t sym_hash = 0;
     for (const wchar_t* p = symbol; *p; p++) sym_hash += (uint32_t)*p;
 
-    double src_off = (s == SRC_BINANCE) ? 0.0 : (s == SRC_COINBASE ? 0.00035 : -0.00028);
+    double src_off = (s == SRC_BINANCE) ? 0.0 :
+        (s == SRC_COINBASE ? 0.00035 : (s == SRC_KRAKEN ? -0.00028 : 0.00018));
     double cursor = base_price * ((tf == TF_1Y) ? 0.25 : (tf == TF_1MO ? 0.55 : 0.945));
 
     for (size_t i = 0; i < count; i++) {
@@ -505,6 +1237,7 @@ static void seed_initial_watchlist(AsyncFeedManager* mgr) {
 
     for (size_t w = 0; w < mgr->watchlist_count; w++) {
         WatchlistItem* item = &mgr->watchlist[w];
+        ZeroMemory(item, sizeof(*item));
         item->id         = mgr->next_wl_id++;
         item->section_id = mgr->sections[0].id;
         ov_wcscpy(item->symbol, 24, kSeeds[w].symbol);
@@ -515,9 +1248,12 @@ static void seed_initial_watchlist(AsyncFeedManager* mgr) {
         item->high_24h   = kSeeds[w].base_price * 1.022;
         item->low_24h    = kSeeds[w].base_price * 0.976;
         item->volume_24h = (kSeeds[w].base_price > 1000.0) ? 18420.0 : 492000.0;
-        item->change_pct = 1.52;
+        item->change_pct = 0.0;
+        item->has_24h_data = false;
         for (int s = 0; s < SRC_COUNT; s++) {
-            item->source_prices[s] = kSeeds[w].base_price * (1.0 + (s - 1) * 0.00025);
+            item->source_prices[s] = s == SRC_COINGECKO
+                ? 0.0
+                : kSeeds[w].base_price * (1.0 + (s - 1) * 0.00025);
         }
         item->last_update_ms = now_ms;
         item->removed = false;
@@ -532,11 +1268,192 @@ static void seed_initial_watchlist(AsyncFeedManager* mgr) {
     }
 }
 
-static void sync_exchange_snapshots(AsyncFeedManager* mgr) {
+static bool json_extract_string(const char* obj, const char* key, wchar_t* out, size_t cap) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* key_pos = strstr(obj, pattern);
+    if (!key_pos) return false;
+    const char* value = key_pos + strlen(pattern);
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value != '"') return false;
+    value++;
+
+    char utf8[256];
+    size_t length = 0;
+    while (*value && *value != '"' && length + 1 < sizeof(utf8)) {
+        if (*value == '\\' && value[1]) {
+            value++;
+            if (*value == 'n') utf8[length++] = '\n';
+            else if (*value == 'r') utf8[length++] = '\r';
+            else if (*value == 't') utf8[length++] = '\t';
+            else utf8[length++] = *value;
+        } else {
+            utf8[length++] = *value;
+        }
+        value++;
+    }
+    utf8[length] = '\0';
+    if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, (int)cap)) return false;
+    return true;
+}
+
+static uint32_t json_extract_u32(const char* obj, const char* key) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* key_pos = strstr(obj, pattern);
+    if (!key_pos) return 0;
+    return (uint32_t)strtoul(key_pos + strlen(pattern), NULL, 10);
+}
+
+static bool json_extract_bool(const char* obj, const char* key) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* key_pos = strstr(obj, pattern);
+    if (!key_pos) return false;
+    key_pos += strlen(pattern);
+    while (*key_pos == ' ' || *key_pos == '\t') key_pos++;
+    return strncmp(key_pos, "true", 4) == 0;
+}
+
+bool feed_manager_load_watchlist_file_w(AsyncFeedManager* mgr, const wchar_t* file_path) {
+    HANDLE h = CreateFileW(
+        file_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    DWORD size = GetFileSize(h, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > 2 * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+
+    char* buf = (char*)malloc((size_t)size + 1);
+    if (!buf) {
+        CloseHandle(h);
+        return false;
+    }
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, size, &got, NULL);
+    CloseHandle(h);
+    if (!ok || got == 0) {
+        free(buf);
+        return false;
+    }
+    buf[got] = '\0';
+
+    AcquireSRWLockExclusive(&mgr->data_lock);
+    mgr->section_count = 0;
+    mgr->watchlist_count = 0;
+    ZeroMemory(mgr->watchlist, sizeof(mgr->watchlist));
+    ZeroMemory(mgr->sections, sizeof(mgr->sections));
+    const char* tokens_pos = strstr(buf, "\"tokens\"");
+
+    const char* sections_pos = strstr(buf, "\"sections\"");
+    if (sections_pos) {
+        const char* array_start = strchr(sections_pos, '[');
+        if (array_start) {
+            int depth = 0;
+            const char* object_start = NULL;
+            for (const char* cur = array_start + 1; cur < buf + got; cur++) {
+                if (*cur == '{') {
+                    if (depth == 0) object_start = cur;
+                    depth++;
+                } else if (*cur == '}' && depth > 0) {
+                    depth--;
+                    if (depth == 0 && object_start) {
+                        size_t span = (size_t)(cur - object_start + 1);
+                        char* obj = (char*)malloc(span + 1);
+                        if (!obj) break;
+                        memcpy(obj, object_start, span);
+                        obj[span] = '\0';
+
+                        WatchlistSection* section = &mgr->sections[mgr->section_count++];
+                        section->id = json_extract_u32(obj, "id");
+                        section->collapsed = json_extract_bool(obj, "collapsed");
+                        json_extract_string(obj, "name", section->name, 48);
+                        free(obj);
+                        object_start = NULL;
+                        if (mgr->section_count >= MAX_WL_SECTIONS) break;
+                    }
+                } else if (*cur == ']' && depth == 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (tokens_pos) {
+        const char* array_start = strchr(tokens_pos, '[');
+        if (array_start) {
+            int depth = 0;
+            const char* object_start = NULL;
+            for (const char* cur = array_start + 1; cur < buf + got; cur++) {
+                if (*cur == '{') {
+                    if (depth == 0) object_start = cur;
+                    depth++;
+                } else if (*cur == '}' && depth > 0) {
+                    depth--;
+                    if (depth == 0 && object_start) {
+                        size_t span = (size_t)(cur - object_start + 1);
+                        char* obj = (char*)malloc(span + 1);
+                        if (!obj) break;
+                        memcpy(obj, object_start, span);
+                        obj[span] = '\0';
+
+                        WatchlistItem* item = &mgr->watchlist[mgr->watchlist_count++];
+                        item->id = json_extract_u32(obj, "id");
+                        item->section_id = json_extract_u32(obj, "sectionId");
+                        json_extract_string(obj, "symbol", item->symbol, 24);
+                        json_extract_string(obj, "name", item->name, 48);
+                        json_extract_string(obj, "displayName", item->display_name, 48);
+                        json_extract_string(obj, "providerId", item->provider_id, 96);
+                        item->removed = false;
+                        free(obj);
+                        object_start = NULL;
+                        if (mgr->watchlist_count >= MAX_WATCHLIST) break;
+                    }
+                } else if (*cur == ']' && depth == 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (mgr->section_count == 0 || mgr->watchlist_count == 0) {
+        mgr->section_count = 0;
+        mgr->watchlist_count = 0;
+        seed_initial_watchlist(mgr);
+    } else {
+        mgr->next_section_id = 1;
+        mgr->next_wl_id = 1;
+        for (size_t i = 0; i < mgr->section_count; i++) {
+            if (mgr->sections[i].id >= mgr->next_section_id) {
+                mgr->next_section_id = mgr->sections[i].id + 1;
+            }
+        }
+        for (size_t i = 0; i < mgr->watchlist_count; i++) {
+            if (mgr->watchlist[i].id >= mgr->next_wl_id) {
+                mgr->next_wl_id = mgr->watchlist[i].id + 1;
+            }
+        }
+        mgr->active_entry_id = mgr->watchlist[0].id;
+        ov_wcscpy(mgr->active_symbol, 24, mgr->watchlist[0].symbol);
+        ov_wcscpy(mgr->active_provider_id, 96, mgr->watchlist[0].provider_id);
+    }
+    ReleaseSRWLockExclusive(&mgr->data_lock);
+
+    free(buf);
+    return true;
+}
+
+static void sync_exchange_snapshots(AsyncFeedManager* mgr, bool refresh_static_source) {
     wchar_t sym[24];
+    wchar_t provider_id[96];
     TimeframeSec tf;
     AcquireSRWLockShared(&mgr->data_lock);
     ov_wcscpy(sym, 24, mgr->active_symbol);
+    ov_wcscpy(provider_id, 96, mgr->active_provider_id);
     tf = mgr->timeframe;
     ReleaseSRWLockShared(&mgr->data_lock);
 
@@ -545,18 +1462,42 @@ static void sync_exchange_snapshots(AsyncFeedManager* mgr) {
     if (!tmp) return;
 
     for (int s = 0; s < SRC_COUNT; s++) {
+        if (s == SRC_COINGECKO && !refresh_static_source) continue;
+        if (s == SRC_COINGECKO && !provider_id[0]) {
+            AcquireSRWLockExclusive(&mgr->data_lock);
+            if (wcscmp(mgr->active_symbol, sym) == 0 &&
+                wcscmp(mgr->active_provider_id, provider_id) == 0 &&
+                mgr->timeframe == tf) {
+                mgr->sources[s].state = STATE_OFFLINE;
+            }
+            ReleaseSRWLockExclusive(&mgr->data_lock);
+            continue;
+        }
         uint32_t lat = 0;
         size_t n = 0;
         if (s == SRC_BINANCE)       n = fetch_binance_candles(sym, tf, tmp, 320, &lat);
         else if (s == SRC_COINBASE) n = fetch_coinbase_candles(sym, tf, tmp, 320, &lat);
-        else                        n = fetch_kraken_candles(sym, tf, tmp, 320, &lat);
+        else if (s == SRC_KRAKEN)   n = fetch_kraken_candles(sym, tf, tmp, 320, &lat);
+        else if (s == SRC_MEXC)     n = fetch_mexc_candles(sym, tf, tmp, 320, &lat);
+        else if (s == SRC_COINGECKO) n = fetch_coingecko_candles(provider_id, tf, tmp, 320, &lat);
+
+        size_t source_min_bars = s == SRC_COINGECKO ? 1 : min_bars;
+        BinanceTicker24h ticker = {0};
+        uint32_t ticker_latency = 0;
+        bool ticker_valid = s == SRC_BINANCE
+            ? fetch_binance_ticker_24h(sym, &ticker, &ticker_latency)
+            : (s == SRC_MEXC &&
+               fetch_mexc_ticker_24h(sym, &ticker, &ticker_latency));
 
         AcquireSRWLockExclusive(&mgr->data_lock);
-        if (wcscmp(mgr->active_symbol, sym) == 0 && mgr->timeframe == tf && n >= min_bars) {
+        bool same_selection = wcscmp(mgr->active_symbol, sym) == 0 &&
+                              wcscmp(mgr->active_provider_id, provider_id) == 0 &&
+                              mgr->timeframe == tf;
+        if (same_selection && n >= source_min_bars) {
             if (n > MAX_CANDLES) n = MAX_CANDLES;
             memcpy(mgr->candles[s], tmp, n * sizeof(CandleBar));
             mgr->candle_counts[s] = n;
-            mgr->sources[s].state = STATE_LIVE;
+            mgr->sources[s].state = s == SRC_COINGECKO ? STATE_STATIC : STATE_LIVE;
             mgr->sources[s].latency_ms = lat;
 
             double last_px = tmp[n - 1].close;
@@ -564,15 +1505,32 @@ static void sync_exchange_snapshots(AsyncFeedManager* mgr) {
                 if (mgr->watchlist[w].removed) continue;
                 if (wcscmp(mgr->watchlist[w].symbol, sym) == 0) {
                     mgr->watchlist[w].source_prices[s] = last_px;
-                    if (s == SRC_BINANCE) {
-                        mgr->watchlist[w].price = last_px;
-                        if (mgr->watchlist[w].open_24h > 0.0) {
-                            mgr->watchlist[w].change_pct =
-                                ((last_px - mgr->watchlist[w].open_24h) / mgr->watchlist[w].open_24h) * 100.0;
-                        }
+                    if ((s == SRC_BINANCE && mgr->primary_source == SRC_BINANCE) ||
+                        (s == SRC_COINGECKO && mgr->primary_source == SRC_COINGECKO)) {
+                        mgr->watchlist[w].price = ticker_valid ? ticker.last_price : last_px;
                     }
                 }
             }
+        } else if (same_selection && s == SRC_COINGECKO) {
+            mgr->sources[s].state = STATE_OFFLINE;
+        }
+        if ((s == SRC_BINANCE || s == SRC_MEXC) && ticker_valid &&
+            wcscmp(mgr->active_symbol, sym) == 0) {
+            for (size_t w = 0; w < mgr->watchlist_count; w++) {
+                WatchlistItem* item = &mgr->watchlist[w];
+                if (item->removed || wcscmp(item->symbol, sym) != 0) continue;
+                item->source_prices[s] = ticker.last_price;
+                if (mgr->primary_source == (FeedSourceId)s) {
+                    item->price = ticker.last_price;
+                    item->open_24h = ticker.open_price;
+                    item->high_24h = ticker.high_price;
+                    item->low_24h = ticker.low_price;
+                    item->volume_24h = ticker.volume;
+                    item->change_pct = ticker.change_pct;
+                    item->has_24h_data = true;
+                }
+            }
+            if (ticker_latency > 0) mgr->sources[s].latency_ms = ticker_latency;
         }
         ReleaseSRWLockExclusive(&mgr->data_lock);
     }
@@ -592,8 +1550,9 @@ static DWORD WINAPI rest_sync_proc(LPVOID param) {
         LONG cur_seq = InterlockedCompareExchange(&mgr->resync_seq, 0, 0);
         int64_t now = now_utc_ms();
         if (cur_seq != last_seq || now >= next_periodic) {
+            bool selection_changed = cur_seq != last_seq;
             last_seq = cur_seq;
-            sync_exchange_snapshots(mgr);
+            sync_exchange_snapshots(mgr, selection_changed);
             next_periodic = now_utc_ms() + 18000;
         }
         Sleep(120);
@@ -608,6 +1567,193 @@ typedef struct {
     const char*       port;
     const char*       ws_path;
 } SourceWorkerCtx;
+
+static bool protobuf_read_varint(
+    const uint8_t** cursor,
+    const uint8_t* end,
+    uint64_t* value
+) {
+    uint64_t result = 0;
+    unsigned shift = 0;
+    while (*cursor < end && shift < 64) {
+        uint8_t byte = *(*cursor)++;
+        result |= (uint64_t)(byte & 0x7FU) << shift;
+        if (!(byte & 0x80U)) {
+            *value = result;
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+static bool protobuf_read_bytes(
+    const uint8_t** cursor,
+    const uint8_t* end,
+    const uint8_t** bytes,
+    size_t* length
+) {
+    uint64_t size = 0;
+    if (!protobuf_read_varint(cursor, end, &size) ||
+        size > (uint64_t)(end - *cursor)) {
+        return false;
+    }
+    *bytes = *cursor;
+    *length = (size_t)size;
+    *cursor += *length;
+    return true;
+}
+
+static bool protobuf_skip_field(
+    const uint8_t** cursor,
+    const uint8_t* end,
+    unsigned wire_type
+) {
+    uint64_t ignored = 0;
+    switch (wire_type) {
+        case 0:
+            return protobuf_read_varint(cursor, end, &ignored);
+        case 1:
+            if ((size_t)(end - *cursor) < 8) return false;
+            *cursor += 8;
+            return true;
+        case 2: {
+            const uint8_t* bytes = NULL;
+            size_t length = 0;
+            return protobuf_read_bytes(cursor, end, &bytes, &length);
+        }
+        case 5:
+            if ((size_t)(end - *cursor) < 4) return false;
+            *cursor += 4;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool protobuf_read_text(
+    const uint8_t** cursor,
+    const uint8_t* end,
+    char* out,
+    size_t out_cap
+) {
+    const uint8_t* bytes = NULL;
+    size_t length = 0;
+    if (!protobuf_read_bytes(cursor, end, &bytes, &length) ||
+        length >= out_cap) {
+        return false;
+    }
+    memcpy(out, bytes, length);
+    out[length] = '\0';
+    return true;
+}
+
+static void parse_mexc_deal(
+    const uint8_t* data,
+    size_t length,
+    const wchar_t* symbol,
+    TickRingBuffer* ring
+) {
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + length;
+    char price_text[48] = "", quantity_text[48] = "";
+    uint64_t timestamp = 0;
+
+    while (cursor < end) {
+        uint64_t tag = 0;
+        if (!protobuf_read_varint(&cursor, end, &tag) || tag == 0) return;
+        unsigned field = (unsigned)(tag >> 3);
+        unsigned wire = (unsigned)(tag & 7U);
+        if (wire == 2 && (field == 1 || field == 2)) {
+            char* destination = field == 1 ? price_text : quantity_text;
+            size_t capacity = field == 1 ? sizeof(price_text) : sizeof(quantity_text);
+            if (!protobuf_read_text(&cursor, end, destination, capacity)) return;
+        } else if (wire == 0 && field == 4) {
+            if (!protobuf_read_varint(&cursor, end, &timestamp)) return;
+        } else if (!protobuf_skip_field(&cursor, end, wire)) {
+            return;
+        }
+    }
+
+    double price = strtod(price_text, NULL);
+    double volume = strtod(quantity_text, NULL);
+    if (price <= 0.0) return;
+    FeedTick tick = {0};
+    ov_wcscpy(tick.symbol, 24, symbol);
+    tick.source = SRC_MEXC;
+    tick.price = price;
+    tick.volume = volume > 0.0 ? volume : 0.0;
+    tick.timestamp_ms = timestamp > 0 ? (int64_t)timestamp : now_utc_ms();
+    ring_push(ring, &tick);
+}
+
+static void parse_mexc_deals(
+    const uint8_t* data,
+    size_t length,
+    const wchar_t* symbol,
+    TickRingBuffer* ring
+) {
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + length;
+    while (cursor < end) {
+        uint64_t tag = 0;
+        if (!protobuf_read_varint(&cursor, end, &tag) || tag == 0) return;
+        unsigned field = (unsigned)(tag >> 3);
+        unsigned wire = (unsigned)(tag & 7U);
+        if (field == 1 && wire == 2) {
+            const uint8_t* deal = NULL;
+            size_t deal_length = 0;
+            if (!protobuf_read_bytes(&cursor, end, &deal, &deal_length)) return;
+            parse_mexc_deal(deal, deal_length, symbol, ring);
+        } else if (!protobuf_skip_field(&cursor, end, wire)) {
+            return;
+        }
+    }
+}
+
+static void parse_mexc_message(
+    const uint8_t* data,
+    size_t length,
+    const wchar_t* symbol,
+    TickRingBuffer* ring
+) {
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + length;
+    while (cursor < end) {
+        uint64_t tag = 0;
+        if (!protobuf_read_varint(&cursor, end, &tag) || tag == 0) return;
+        unsigned field = (unsigned)(tag >> 3);
+        unsigned wire = (unsigned)(tag & 7U);
+        if (field == 314 && wire == 2) {
+            const uint8_t* deals = NULL;
+            size_t deals_length = 0;
+            if (!protobuf_read_bytes(&cursor, end, &deals, &deals_length)) return;
+            parse_mexc_deals(deals, deals_length, symbol, ring);
+        } else if (!protobuf_skip_field(&cursor, end, wire)) {
+            return;
+        }
+    }
+}
+
+typedef struct {
+    HINTERNET websocket;
+    PFN_WinHttpWebSocketSend send;
+    volatile LONG running;
+} MexcPingContext;
+
+static DWORD WINAPI mexc_ping_proc(LPVOID param) {
+    MexcPingContext* ctx = (MexcPingContext*)param;
+    static const char ping[] = "{\"method\":\"PING\"}";
+    while (InterlockedCompareExchange(&ctx->running, 0, 0) == 1) {
+        for (int i = 0; i < 20 && InterlockedCompareExchange(&ctx->running, 0, 0) == 1; i++) {
+            Sleep(1000);
+        }
+        if (InterlockedCompareExchange(&ctx->running, 0, 0) == 1) {
+            ctx->send(ctx->websocket, 2, (PVOID)ping, (DWORD)(sizeof(ping) - 1));
+        }
+    }
+    return 0;
+}
 
 static DWORD WINAPI source_worker_proc(LPVOID param) {
     SourceWorkerCtx* ctx = (SourceWorkerCtx*)param;
@@ -648,11 +1794,13 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
 
             char base[16], quote[16];
             split_symbol(sym, base, sizeof(base), quote, sizeof(quote));
-            for (char* c = base; *c; c++) {
-                if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
-            }
-            for (char* c = quote; *c; c++) {
-                if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+            if (sid == SRC_BINANCE) {
+                for (char* c = base; *c; c++) {
+                    if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+                }
+                for (char* c = quote; *c; c++) {
+                    if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+                }
             }
 
             if (sid == SRC_BINANCE) {
@@ -660,6 +1808,8 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
                 MultiByteToWideChar(CP_UTF8, 0, base, -1, wb, 16);
                 MultiByteToWideChar(CP_UTF8, 0, quote, -1, wq, 16);
                 swprintf(wpath, 128, L"/ws/%ls%ls@trade", wb, wq);
+            } else if (sid == SRC_MEXC) {
+                MultiByteToWideChar(CP_UTF8, 0, ctx->ws_path, -1, wpath, 128);
             } else {
                 MultiByteToWideChar(CP_UTF8, 0, ctx->ws_path, -1, wpath, 128);
             }
@@ -688,8 +1838,24 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
                     mgr->sources[sid].state = STATE_LIVE;
                     ReleaseSRWLockExclusive(&mgr->data_lock);
 
-                    /* Subscribe for Coinbase / Kraken */
-                    if (sid == SRC_COINBASE || sid == SRC_KRAKEN) {
+                    MexcPingContext ping_ctx = {0};
+                    HANDLE ping_thread = NULL;
+                    if (sid == SRC_MEXC) {
+                        char pair[32], sub_msg[192];
+                        snprintf(pair, sizeof(pair), "%s%s", base, quote);
+                        for (char* c = pair; *c; c++) {
+                            if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+                        }
+                        snprintf(sub_msg, sizeof(sub_msg),
+                                 "{\"method\":\"SUBSCRIPTION\",\"params\":[\"spot@public.aggre.deals.v3.api.pb@100ms@%s\"]}",
+                                 pair);
+                        if (pfnSend(hWs, 2, sub_msg, (DWORD)strlen(sub_msg)) == ERROR_SUCCESS) {
+                            ping_ctx.websocket = hWs;
+                            ping_ctx.send = pfnSend;
+                            ping_ctx.running = 1;
+                            ping_thread = CreateThread(NULL, 0, mexc_ping_proc, &ping_ctx, 0, NULL);
+                        }
+                    } else if (sid == SRC_COINBASE || sid == SRC_KRAKEN) {
                         char ub[16], sub_msg[256];
                         split_symbol(sym, ub, sizeof(ub), quote, sizeof(quote));
                         if (sid == SRC_COINBASE) {
@@ -704,7 +1870,7 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
                         pfnSend(hWs, 0, sub_msg, (DWORD)strlen(sub_msg));
                     }
 
-                    char frame_buf[4096];
+                    char frame_buf[16384];
                     wchar_t cur_sym[24];
                     ov_wcscpy(cur_sym, 24, sym);
 
@@ -718,6 +1884,10 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
                         int btype = 0;
                         DWORD err = pfnRecv(hWs, frame_buf, sizeof(frame_buf) - 1, &got, &btype);
                         if (err != ERROR_SUCCESS || btype == 4) break;
+                        if (sid == SRC_MEXC) {
+                            parse_mexc_message((const uint8_t*)frame_buf, got, cur_sym, &mgr->ring);
+                            continue;
+                        }
                         frame_buf[got] = '\0';
 
                         const char* pf = strstr(frame_buf, "\"p\":\"");
@@ -753,6 +1923,11 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
                         }
                     }
 
+                    if (ping_thread) {
+                        InterlockedExchange(&ping_ctx.running, 0);
+                        WaitForSingleObject(ping_thread, 1500);
+                        CloseHandle(ping_thread);
+                    }
                     pfnClose(hWs, 1000, NULL, 0);
                     WinHttpCloseHandle(hWs);
                 }
@@ -760,6 +1935,31 @@ static DWORD WINAPI source_worker_proc(LPVOID param) {
             if (hReq)  WinHttpCloseHandle(hReq);
             if (hConn) WinHttpCloseHandle(hConn);
             if (hSess) WinHttpCloseHandle(hSess);
+        }
+
+        if (!connected_ws && sid == SRC_MEXC) {
+            for (int tick_i = 0; tick_i < 10 &&
+                 InterlockedCompareExchange(&mgr->running, 0, 0) == 1; tick_i++) {
+                wchar_t sym[24];
+                AcquireSRWLockShared(&mgr->data_lock);
+                ov_wcscpy(sym, 24, mgr->active_symbol);
+                ReleaseSRWLockShared(&mgr->data_lock);
+
+                double price = fetch_mexc_last_price(sym);
+                AcquireSRWLockExclusive(&mgr->data_lock);
+                mgr->sources[sid].state = price > 0.0 ? STATE_LIVE : STATE_OFFLINE;
+                ReleaseSRWLockExclusive(&mgr->data_lock);
+                if (price > 0.0) {
+                    FeedTick tick = {0};
+                    ov_wcscpy(tick.symbol, 24, sym);
+                    tick.source = sid;
+                    tick.price = price;
+                    tick.timestamp_ms = now_utc_ms();
+                    ring_push(&mgr->ring, &tick);
+                }
+                Sleep(1000);
+            }
+            continue;
         }
 
         if (!connected_ws) {
@@ -817,12 +2017,14 @@ static DWORD WINAPI sync_aggregator_proc(LPVOID param) {
             if (item->removed) continue;
             if (wcscmp(item->symbol, tk.symbol) == 0) {
                 item->source_prices[tk.source] = tk.price;
-                if (tk.source == mgr->primary_source || mgr->sources[mgr->primary_source].state != STATE_LIVE) {
+                if (tk.source == mgr->primary_source ||
+                    (mgr->sources[mgr->primary_source].state != STATE_LIVE &&
+                     mgr->sources[mgr->primary_source].state != STATE_STATIC)) {
                     item->price = tk.price;
                     if (tk.price > item->high_24h) item->high_24h = tk.price;
                     if (item->low_24h <= 0.0 || tk.price < item->low_24h) item->low_24h = tk.price;
                     item->volume_24h += tk.volume;
-                    if (item->open_24h > 0.0) {
+                    if (item->has_24h_data && item->open_24h > 0.0) {
                         item->change_pct = ((item->price - item->open_24h) / item->open_24h) * 100.0;
                     }
                 }
@@ -888,6 +2090,7 @@ bool feed_manager_init(AsyncFeedManager* mgr, HWND ui_hwnd) {
     InitializeSRWLock(&mgr->ring.lock);
     InitializeConditionVariable(&mgr->ring.not_empty);
     InitializeSRWLock(&mgr->data_lock);
+    InitializeSRWLock(&mgr->market_lock);
 
     ov_wcscpy(mgr->sources[SRC_BINANCE].label, 24, L"Binance");
     ov_wcscpy(mgr->sources[SRC_BINANCE].endpoint, 64, L"wss://stream.binance.com:9443");
@@ -895,8 +2098,18 @@ bool feed_manager_init(AsyncFeedManager* mgr, HWND ui_hwnd) {
     ov_wcscpy(mgr->sources[SRC_COINBASE].endpoint, 64, L"wss://ws-feed.exchange.coinbase.com");
     ov_wcscpy(mgr->sources[SRC_KRAKEN].label, 24, L"Kraken");
     ov_wcscpy(mgr->sources[SRC_KRAKEN].endpoint, 64, L"wss://ws.kraken.com/v2");
+    ov_wcscpy(mgr->sources[SRC_MEXC].label, 24, L"MEXC");
+    ov_wcscpy(mgr->sources[SRC_MEXC].endpoint, 64, L"wss://wbs-api.mexc.com/ws");
+    ov_wcscpy(mgr->sources[SRC_COINGECKO].label, 24, L"CoinGecko");
+    ov_wcscpy(mgr->sources[SRC_COINGECKO].endpoint, 64, L"api.coingecko.com");
+    mgr->sources[SRC_COINGECKO].id = SRC_COINGECKO;
+    mgr->sources[SRC_COINGECKO].state = STATE_SYNCING;
 
     seed_initial_watchlist(mgr);
+    wchar_t watchlist_path[MAX_PATH];
+    if (ov_state_path(watchlist_path, MAX_PATH, L"openview_watchlist.json")) {
+        feed_manager_load_watchlist_file_w(mgr, watchlist_path);
+    }
 
     mgr->sync_thread = CreateThread(NULL, 0, sync_aggregator_proc, mgr, 0, NULL);
     mgr->rest_thread = CreateThread(NULL, 0, rest_sync_proc, mgr, 0, NULL);
@@ -906,13 +2119,14 @@ bool feed_manager_init(AsyncFeedManager* mgr, HWND ui_hwnd) {
         const char*  host;
         const char*  port;
         const char*  path;
-    } kEndpoints[SRC_COUNT] = {
+    } kEndpoints[SRC_COINGECKO] = {
         { SRC_BINANCE,  "stream.binance.com",            "9443", "/ws/btcusdt@trade" },
         { SRC_COINBASE, "ws-feed.exchange.coinbase.com", "443",  "/" },
-        { SRC_KRAKEN,   "ws.kraken.com",                 "443",  "/v2" }
+        { SRC_KRAKEN,   "ws.kraken.com",                 "443",  "/v2" },
+        { SRC_MEXC,     "wbs-api.mexc.com",              "443",  "/ws" }
     };
 
-    for (int i = 0; i < SRC_COUNT; i++) {
+    for (int i = 0; i < SRC_COINGECKO; i++) {
         SourceWorkerCtx* ctx = (SourceWorkerCtx*)calloc(1, sizeof(SourceWorkerCtx));
         if (!ctx) continue;
         ctx->mgr       = mgr;
@@ -947,44 +2161,49 @@ void feed_manager_shutdown(AsyncFeedManager* mgr) {
         CloseHandle(mgr->sync_thread);
         mgr->sync_thread = NULL;
     }
+    for (int s = 0; s < SRC_COUNT; s++) {
+        free(mgr->market_cache[s]);
+        mgr->market_cache[s] = NULL;
+        mgr->market_cache_counts[s] = 0;
+    }
     WSACleanup();
 }
 
 void feed_manager_set_active_symbol(AsyncFeedManager* mgr, const wchar_t* symbol) {
     AcquireSRWLockExclusive(&mgr->data_lock);
     ov_wcscpy(mgr->active_symbol, 24, symbol);
+    mgr->active_provider_id[0] = L'\0';
     for (size_t w = 0; w < mgr->watchlist_count; w++) {
         if (!mgr->watchlist[w].removed && wcscmp(mgr->watchlist[w].symbol, symbol) == 0) {
             mgr->active_entry_id = mgr->watchlist[w].id;
+            ov_wcscpy(mgr->active_provider_id, 96, mgr->watchlist[w].provider_id);
             break;
         }
     }
-    for (int s = 0; s < SRC_COUNT; s++) {
-        build_seed_candles_locked(mgr, mgr->active_symbol, mgr->timeframe, (FeedSourceId)s);
-    }
+    clear_candle_cache_locked(mgr);
     ReleaseSRWLockExclusive(&mgr->data_lock);
     InterlockedIncrement(&mgr->resync_seq);
 }
 
 void feed_manager_set_active_entry(AsyncFeedManager* mgr, uint32_t entry_id) {
-    bool sym_changed = false;
+    bool selection_changed = false;
     AcquireSRWLockExclusive(&mgr->data_lock);
     for (size_t w = 0; w < mgr->watchlist_count; w++) {
         WatchlistItem* it = &mgr->watchlist[w];
         if (!it->removed && it->id == entry_id) {
             mgr->active_entry_id = entry_id;
-            if (wcscmp(mgr->active_symbol, it->symbol) != 0) {
+            selection_changed = wcscmp(mgr->active_symbol, it->symbol) != 0 ||
+                                wcscmp(mgr->active_provider_id, it->provider_id) != 0;
+            if (selection_changed) {
                 ov_wcscpy(mgr->active_symbol, 24, it->symbol);
-                for (int s = 0; s < SRC_COUNT; s++) {
-                    build_seed_candles_locked(mgr, mgr->active_symbol, mgr->timeframe, (FeedSourceId)s);
-                }
-                sym_changed = true;
+                ov_wcscpy(mgr->active_provider_id, 96, it->provider_id);
+                clear_candle_cache_locked(mgr);
             }
             break;
         }
     }
     ReleaseSRWLockExclusive(&mgr->data_lock);
-    if (sym_changed) {
+    if (selection_changed) {
         InterlockedIncrement(&mgr->resync_seq);
     }
 }
@@ -992,9 +2211,7 @@ void feed_manager_set_active_entry(AsyncFeedManager* mgr, uint32_t entry_id) {
 void feed_manager_set_timeframe(AsyncFeedManager* mgr, TimeframeSec tf) {
     AcquireSRWLockExclusive(&mgr->data_lock);
     mgr->timeframe = tf;
-    for (int s = 0; s < SRC_COUNT; s++) {
-        build_seed_candles_locked(mgr, mgr->active_symbol, mgr->timeframe, (FeedSourceId)s);
-    }
+    clear_candle_cache_locked(mgr);
     ReleaseSRWLockExclusive(&mgr->data_lock);
     InterlockedIncrement(&mgr->resync_seq);
 }
@@ -1002,7 +2219,9 @@ void feed_manager_set_timeframe(AsyncFeedManager* mgr, TimeframeSec tf) {
 void feed_manager_set_primary_source(AsyncFeedManager* mgr, FeedSourceId src) {
     AcquireSRWLockExclusive(&mgr->data_lock);
     mgr->primary_source = src;
+    clear_candle_cache_locked(mgr);
     ReleaseSRWLockExclusive(&mgr->data_lock);
+    InterlockedIncrement(&mgr->resync_seq);
 }
 
 void feed_manager_toggle_overlay(AsyncFeedManager* mgr, FeedSourceId src) {
@@ -1032,7 +2251,13 @@ static WatchlistItem* alloc_watchlist_slot_locked(AsyncFeedManager* mgr) {
     return NULL;
 }
 
-bool feed_manager_add_token(AsyncFeedManager* mgr, const wchar_t* symbol, const wchar_t* name, uint32_t section_id) {
+bool feed_manager_add_token(
+    AsyncFeedManager* mgr,
+    const wchar_t* symbol,
+    const wchar_t* name,
+    const wchar_t* provider_id,
+    uint32_t section_id
+) {
     if (!symbol || !symbol[0]) return false;
     wchar_t clean[24];
     size_t out_i = 0;
@@ -1072,24 +2297,58 @@ bool feed_manager_add_token(AsyncFeedManager* mgr, const wchar_t* symbol, const 
         clone.section_id = target_sec;
         clone.removed    = false;
         clone.last_update_ms = now_utc_ms();
+        ov_wcscpy(clone.provider_id, 96, provider_id);
 
         wchar_t base[24];
         ov_wcscpy(base, 24, clean);
         wchar_t* sl = wcschr(base, L'/');
         if (sl) *sl = L'\0';
-        swprintf(clone.display_name, 48, L"%ls (copie %zu)", base, existing_count + 1);
+        wchar_t copy_label[24], origin_suffix[24];
+        swprintf(copy_label, 24, L"(copie %zu)", existing_count + 1);
+        origin_suffix[0] = L'\0';
+        if (name && name[0]) {
+            const wchar_t* suffix = NULL;
+            for (const wchar_t* p = name; (p = wcsstr(p, L" (")) != NULL; p += 2) {
+                suffix = p;
+            }
+            size_t name_len = wcslen(name);
+            if (suffix && name_len > (size_t)(suffix - name) + 2 && name[name_len - 1] == L')') {
+                ov_wcscpy(origin_suffix, 24, suffix);
+            }
+            ov_wcscpy(clone.name, 48, name);
+        }
+
+        size_t copy_len = wcslen(copy_label);
+        size_t suffix_len = wcslen(origin_suffix);
+        size_t base_len = wcslen(base);
+        size_t available = 47 - copy_len - suffix_len - (suffix_len ? 2 : 1);
+        if (base_len > available) base_len = available;
+        size_t label_len = 0;
+        if (base_len) {
+            wmemcpy(clone.display_name, base, base_len);
+            label_len = base_len;
+            clone.display_name[label_len++] = L' ';
+        }
+        wmemcpy(clone.display_name + label_len, copy_label, copy_len);
+        label_len += copy_len;
+        if (suffix_len) {
+            clone.display_name[label_len++] = L' ';
+            wmemcpy(clone.display_name + label_len, origin_suffix, suffix_len);
+            label_len += suffix_len;
+        }
+        clone.display_name[label_len] = L'\0';
 
         *it = clone;
         mgr->active_entry_id = it->id;
-        bool sym_changed = (wcscmp(mgr->active_symbol, clean) != 0);
-        if (sym_changed) {
+        bool selection_changed = wcscmp(mgr->active_symbol, clean) != 0 ||
+                                 wcscmp(mgr->active_provider_id, clone.provider_id) != 0;
+        if (selection_changed) {
             ov_wcscpy(mgr->active_symbol, 24, clean);
-            for (int s = 0; s < SRC_COUNT; s++) {
-                build_seed_candles_locked(mgr, clean, mgr->timeframe, (FeedSourceId)s);
-            }
+            ov_wcscpy(mgr->active_provider_id, 96, clone.provider_id);
+            clear_candle_cache_locked(mgr);
         }
         ReleaseSRWLockExclusive(&mgr->data_lock);
-        if (sym_changed) InterlockedIncrement(&mgr->resync_seq);
+        if (selection_changed) InterlockedIncrement(&mgr->resync_seq);
         return true;
     }
 
@@ -1097,6 +2356,7 @@ bool feed_manager_add_token(AsyncFeedManager* mgr, const wchar_t* symbol, const 
     it->id         = mgr->next_wl_id++;
     it->section_id = target_sec;
     ov_wcscpy(it->symbol, 24, clean);
+    ov_wcscpy(it->provider_id, 96, provider_id);
     if (name && name[0]) {
         ov_wcscpy(it->name, 48, name);
     } else {
@@ -1105,22 +2365,13 @@ bool feed_manager_add_token(AsyncFeedManager* mgr, const wchar_t* symbol, const 
         if (sl) *sl = L'\0';
     }
     it->display_name[0] = L'\0';
-    it->price      = 25.0;
-    it->open_24h   = 24.75;
-    it->high_24h   = 25.75;
-    it->low_24h    = 24.25;
-    it->volume_24h = 125000.0;
-    it->change_pct = 1.01;
-    it->source_prices[SRC_BINANCE]  = 25.0;
-    it->source_prices[SRC_COINBASE] = 25.005;
-    it->source_prices[SRC_KRAKEN]   = 24.995;
+    it->has_24h_data = false;
     it->last_update_ms = now_utc_ms();
 
     mgr->active_entry_id = it->id;
     ov_wcscpy(mgr->active_symbol, 24, clean);
-    for (int s = 0; s < SRC_COUNT; s++) {
-        build_seed_candles_locked(mgr, clean, mgr->timeframe, (FeedSourceId)s);
-    }
+    ov_wcscpy(mgr->active_provider_id, 96, it->provider_id);
+    clear_candle_cache_locked(mgr);
     ReleaseSRWLockExclusive(&mgr->data_lock);
     InterlockedIncrement(&mgr->resync_seq);
     return true;
@@ -1166,15 +2417,15 @@ bool feed_manager_clone_entry(AsyncFeedManager* mgr, uint32_t entry_id) {
     swprintf(dst->display_name, 48, L"%ls (copie %zu)", base, same_sym + 1);
 
     mgr->active_entry_id = dst->id;
-    bool sym_changed = (wcscmp(mgr->active_symbol, dst->symbol) != 0);
-    if (sym_changed) {
+    bool selection_changed = wcscmp(mgr->active_symbol, dst->symbol) != 0 ||
+                             wcscmp(mgr->active_provider_id, dst->provider_id) != 0;
+    if (selection_changed) {
         ov_wcscpy(mgr->active_symbol, 24, dst->symbol);
-        for (int s = 0; s < SRC_COUNT; s++) {
-            build_seed_candles_locked(mgr, dst->symbol, mgr->timeframe, (FeedSourceId)s);
-        }
+        ov_wcscpy(mgr->active_provider_id, 96, dst->provider_id);
+        clear_candle_cache_locked(mgr);
     }
     ReleaseSRWLockExclusive(&mgr->data_lock);
-    if (sym_changed) InterlockedIncrement(&mgr->resync_seq);
+    if (selection_changed) InterlockedIncrement(&mgr->resync_seq);
     return true;
 }
 
@@ -1319,14 +2570,16 @@ void feed_manager_remove_entry(AsyncFeedManager* mgr, uint32_t entry_id) {
     }
     if (mgr->active_entry_id == entry_id) {
         mgr->active_entry_id = 0;
+        mgr->active_provider_id[0] = L'\0';
         for (size_t w = 0; w < mgr->watchlist_count; w++) {
             if (!mgr->watchlist[w].removed) {
                 mgr->active_entry_id = mgr->watchlist[w].id;
-                if (wcscmp(mgr->active_symbol, mgr->watchlist[w].symbol) != 0) {
-                    ov_wcscpy(mgr->active_symbol, 24, mgr->watchlist[w].symbol);
-                    for (int s = 0; s < SRC_COUNT; s++) {
-                        build_seed_candles_locked(mgr, mgr->active_symbol, mgr->timeframe, (FeedSourceId)s);
-                    }
+                bool selection_changed = wcscmp(mgr->active_symbol, mgr->watchlist[w].symbol) != 0 ||
+                                         wcscmp(mgr->active_provider_id, mgr->watchlist[w].provider_id) != 0;
+                ov_wcscpy(mgr->active_symbol, 24, mgr->watchlist[w].symbol);
+                ov_wcscpy(mgr->active_provider_id, 96, mgr->watchlist[w].provider_id);
+                if (selection_changed) {
+                    clear_candle_cache_locked(mgr);
                     resync = true;
                 }
                 break;
@@ -1347,16 +2600,17 @@ void feed_manager_remove_token(AsyncFeedManager* mgr, const wchar_t* symbol) {
     }
     if (wcscmp(mgr->active_symbol, symbol) == 0) {
         mgr->active_entry_id = 0;
+        mgr->active_provider_id[0] = L'\0';
         for (size_t w = 0; w < mgr->watchlist_count; w++) {
             if (!mgr->watchlist[w].removed) {
                 mgr->active_entry_id = mgr->watchlist[w].id;
                 ov_wcscpy(mgr->active_symbol, 24, mgr->watchlist[w].symbol);
-                for (int s = 0; s < SRC_COUNT; s++) {
-                    build_seed_candles_locked(mgr, mgr->active_symbol, mgr->timeframe, (FeedSourceId)s);
-                }
+                ov_wcscpy(mgr->active_provider_id, 96, mgr->watchlist[w].provider_id);
+                clear_candle_cache_locked(mgr);
                 break;
             }
         }
+        if (mgr->active_entry_id == 0) clear_candle_cache_locked(mgr);
     }
     ReleaseSRWLockExclusive(&mgr->data_lock);
     InterlockedIncrement(&mgr->resync_seq);

@@ -30,4 +30,13 @@ bool export_workspace_json_w(
     const AlertEngine* alerts
 );
 
+bool export_watchlist_state_json_w(
+    const wchar_t* file_path,
+    const WatchlistSection* sections,
+    size_t section_count,
+    const WatchlistItem* watchlist,
+    size_t watchlist_count,
+    const DrawingStore* drawings
+);
+
 #endif /* OV_EXPORT_H */

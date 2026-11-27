@@ -6,16 +6,20 @@
 
 UNAME_S := $(shell uname -s 2>/dev/null)
 ifeq ($(OS),Windows_NT)
-  CC ?= gcc
+  ifeq ($(origin CC),default)
+    CC := gcc
+  endif
   MKDIR = if not exist bin mkdir bin
   RM = if exist bin rmdir /s /q bin
 else
-  CC ?= x86_64-w64-mingw32-gcc
+  ifeq ($(origin CC),default)
+    CC := x86_64-w64-mingw32-gcc
+  endif
   MKDIR = mkdir -p bin
   RM = rm -rf bin
 endif
 
-TARGET   := bin/OpenViewWin32.exe
+TARGET   := OpenView.exe
 SRC_DIR  := C/src
 INC_DIR  := C/include
 
@@ -34,7 +38,7 @@ CFLAGS := -std=c11 -O2 -Wall -Wextra -municode \
 	-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -D__USE_MINGW_ANSI_STDIO=1 \
 	-I$(INC_DIR)
 
-LDFLAGS := -mwindows -municode \
+LDFLAGS := -s -mwindows -municode \
 	-ld2d1 -ldwrite -lws2_32 -lwinhttp -lcomdlg32 -ldwmapi -luser32 -lgdi32 -lwinmm -lole32
 
 .PHONY: all clean run
@@ -42,7 +46,6 @@ LDFLAGS := -mwindows -municode \
 all: $(TARGET)
 
 $(TARGET): $(SRCS)
-	$(MKDIR)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
 
 run: $(TARGET)

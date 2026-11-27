@@ -119,11 +119,21 @@ typedef enum {
 } DragMode;
 
 typedef struct {
+    uint32_t color;
+    float width;
+    DrawingLineStyle line_style;
+    DrawingLabelAlignH align_h;
+    DrawingLabelAlignV align_v;
+    wchar_t label[64];
+} DrawingStyleDefaults;
+
+typedef struct {
     AsyncFeedManager   feed;
     D2DRenderer        renderer;
     IndicatorSettings  ind_cfg;
     IndicatorBuffers   ind_buf;
     DrawingStore       drawings;
+    DrawingStyleDefaults drawing_defaults[TOOL_TEXT + 1];
     AlertEngine        alerts;
     ChartViewportState viewport;
     DragMode           drag_mode;
@@ -131,6 +141,7 @@ typedef struct {
     float              drag_start_y_dip;
     float              drag_start_pan;
     float              drag_start_y_scale;
+    float              drag_start_y_pan;
     uint32_t           drag_drawing_id;
     int                drag_point_idx;
 } AppState;
@@ -154,11 +165,217 @@ static void update_titlebar_theme(HWND hwnd, bool dark) {
 }
 
 static void persist_drawings(const AppState* app) {
-    drawings_save_file_w(&app->drawings, L"openview_drawings.json");
+    wchar_t drawings_path[MAX_PATH];
+    wchar_t watchlist_path[MAX_PATH];
+    if (ov_state_path(drawings_path, MAX_PATH, L"openview_drawings.json")) {
+        drawings_save_file_w(&app->drawings, drawings_path);
+    }
+    WatchlistSection sections[MAX_WL_SECTIONS];
+    WatchlistItem watchlist[MAX_WATCHLIST];
+    size_t section_count = feed_manager_copy_sections(
+        (AsyncFeedManager*)&app->feed, sections, MAX_WL_SECTIONS
+    );
+    size_t watchlist_count = feed_manager_copy_watchlist(
+        (AsyncFeedManager*)&app->feed, watchlist, MAX_WATCHLIST
+    );
+    if (ov_state_path(watchlist_path, MAX_PATH, L"openview_watchlist.json")) {
+        export_watchlist_state_json_w(
+            watchlist_path,
+            sections,
+            section_count,
+            watchlist,
+            watchlist_count,
+            &app->drawings
+        );
+    }
+}
+
+typedef struct {
+    TimeframeSec timeframe;
+    FeedSourceId primary_source;
+    IndicatorSettings indicators;
+} AppSettings;
+
+static void persist_settings(
+    TimeframeSec timeframe,
+    FeedSourceId primary_source,
+    const IndicatorSettings* indicators
+) {
+    wchar_t path[MAX_PATH];
+    if (!ov_state_path(path, MAX_PATH, L"openview_settings.json")) return;
+    HANDLE h = CreateFileW(
+        path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char json[512];
+    int len = snprintf(
+        json, sizeof(json),
+        "{\"timeframe\":%d,\"primary_source\":%d,"
+        "\"enable_ema_fast\":%d,\"enable_ema_slow\":%d,"
+        "\"enable_sma\":%d,\"enable_bb\":%d,\"enable_rsi\":%d,\"enable_macd\":%d,"
+        "\"ema_fast_period\":%d,\"ema_slow_period\":%d,\"sma_period\":%d,"
+        "\"bb_period\":%d,\"bb_stddev\":%.6f,\"rsi_period\":%d,"
+        "\"macd_fast\":%d,\"macd_slow\":%d,\"macd_signal\":%d}\n",
+        (int)timeframe, (int)primary_source,
+        indicators->enable_ema_fast, indicators->enable_ema_slow,
+        indicators->enable_sma, indicators->enable_bb,
+        indicators->enable_rsi, indicators->enable_macd,
+        indicators->ema_fast_period, indicators->ema_slow_period,
+        indicators->sma_period, indicators->bb_period, indicators->bb_stddev,
+        indicators->rsi_period, indicators->macd_fast, indicators->macd_slow,
+        indicators->macd_signal
+    );
+    DWORD written = 0;
+    if (len > 0 && (size_t)len < sizeof(json)) {
+        WriteFile(h, json, (DWORD)len, &written, NULL);
+    }
+    CloseHandle(h);
+}
+
+static bool settings_read_long(const char* json, const char* key, long* out) {
+    char field[64];
+    int len = snprintf(field, sizeof(field), "\"%s\":", key);
+    if (len <= 0 || (size_t)len >= sizeof(field)) return false;
+    const char* value = strstr(json, field);
+    if (!value) return false;
+    value += len;
+    char* end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value) return false;
+    *out = parsed;
+    return true;
+}
+
+static bool settings_read_double(const char* json, const char* key, double* out) {
+    char field[64];
+    int len = snprintf(field, sizeof(field), "\"%s\":", key);
+    if (len <= 0 || (size_t)len >= sizeof(field)) return false;
+    const char* value = strstr(json, field);
+    if (!value) return false;
+    value += len;
+    char* end = NULL;
+    double parsed = strtod(value, &end);
+    if (end == value || !isfinite(parsed)) return false;
+    *out = parsed;
+    return true;
+}
+
+static AppSettings load_settings(void) {
+    AppSettings settings = {0};
+    settings.timeframe = TF_15M;
+    settings.primary_source = SRC_BINANCE;
+    indicators_default_settings(&settings.indicators);
+    wchar_t path[MAX_PATH];
+    if (!ov_state_path(path, MAX_PATH, L"openview_settings.json")) return settings;
+    HANDLE h = CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return settings;
+
+    char buf[512];
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
+    CloseHandle(h);
+    if (!ok || got == 0) return settings;
+    buf[got] = '\0';
+
+    const char* value = strstr(buf, "\"timeframe\":");
+    if (value) {
+        long tf = strtol(value + strlen("\"timeframe\":"), NULL, 10);
+        switch (tf) {
+            case TF_1M: case TF_5M: case TF_15M: case TF_1H: case TF_4H:
+            case TF_1D: case TF_1W: case TF_1MO: case TF_1Y:
+                settings.timeframe = (TimeframeSec)tf;
+                break;
+            default:
+                break;
+        }
+    }
+
+    value = strstr(buf, "\"primary_source\":");
+    if (value) {
+        long source = strtol(value + strlen("\"primary_source\":"), NULL, 10);
+        if (source >= SRC_BINANCE && source < SRC_COUNT) {
+            settings.primary_source = (FeedSourceId)source;
+        }
+    }
+
+    long number;
+#define LOAD_INDICATOR_BOOL(field) \
+    do { \
+        if (settings_read_long(buf, #field, &number)) settings.indicators.field = number != 0; \
+    } while (0)
+#define LOAD_INDICATOR_PERIOD(field) \
+    do { \
+        if (settings_read_long(buf, #field, &number) && number >= 2 && number <= 10000) \
+            settings.indicators.field = (int)number; \
+    } while (0)
+    LOAD_INDICATOR_BOOL(enable_ema_fast);
+    LOAD_INDICATOR_BOOL(enable_ema_slow);
+    LOAD_INDICATOR_BOOL(enable_sma);
+    LOAD_INDICATOR_BOOL(enable_bb);
+    LOAD_INDICATOR_BOOL(enable_rsi);
+    LOAD_INDICATOR_BOOL(enable_macd);
+    LOAD_INDICATOR_PERIOD(ema_fast_period);
+    LOAD_INDICATOR_PERIOD(ema_slow_period);
+    LOAD_INDICATOR_PERIOD(sma_period);
+    LOAD_INDICATOR_PERIOD(bb_period);
+    LOAD_INDICATOR_PERIOD(rsi_period);
+    LOAD_INDICATOR_PERIOD(macd_fast);
+    LOAD_INDICATOR_PERIOD(macd_slow);
+    LOAD_INDICATOR_PERIOD(macd_signal);
+#undef LOAD_INDICATOR_BOOL
+#undef LOAD_INDICATOR_PERIOD
+    double bb_stddev;
+    if (settings_read_double(buf, "bb_stddev", &bb_stddev) &&
+        bb_stddev > 0.0 && bb_stddev <= 100.0) {
+        settings.indicators.bb_stddev = bb_stddev;
+    }
+    return settings;
+}
+
+static uint32_t add_drawing_with_defaults(
+    AppState* app,
+    DrawingToolKind kind,
+    const AnchorPoint* points,
+    size_t point_count,
+    const wchar_t* label
+) {
+    DrawingStyleDefaults* style = &app->drawing_defaults[kind];
+    uint32_t id = drawings_add(
+        &app->drawings,
+        app->feed.active_entry_id,
+        app->feed.active_symbol,
+        kind,
+        points,
+        point_count,
+        style->color,
+        style->width,
+        style->line_style,
+        label ? label : style->label
+    );
+    ChartDrawing* drawing = drawings_find_by_id(&app->drawings, id);
+    if (drawing) {
+        drawing->label_align_h = style->align_h;
+        drawing->label_align_v = style->align_v;
+    }
+    return id;
 }
 
 static bool is_active_entry_primary(AppState* app) {
     return feed_manager_is_primary_entry(&app->feed, app->feed.active_entry_id, app->feed.active_symbol);
+}
+
+static void select_watchlist_entry(AppState* app, uint32_t entry_id) {
+    feed_manager_set_active_entry(&app->feed, entry_id);
+    FeedSourceId source = app->feed.active_provider_id[0]
+        ? SRC_COINGECKO
+        : (app->feed.primary_source == SRC_COINGECKO ? SRC_BINANCE : app->feed.primary_source);
+    if (source != app->feed.primary_source) {
+        feed_manager_set_primary_source(&app->feed, source);
+        app->viewport.last_primary_tick_ms = 0;
+    }
 }
 
 static void refresh_analytics(AppState* app, HWND hwnd) {
@@ -169,7 +386,9 @@ static void refresh_analytics(AppState* app, HWND hwnd) {
 
     const WatchlistItem* active_tok = NULL;
     for (size_t i = 0; i < wn; i++) {
-        if (!wl[i].removed && wcscmp(wl[i].symbol, app->feed.active_symbol) == 0) {
+        if (!wl[i].removed &&
+            (wl[i].id == app->feed.active_entry_id ||
+             (app->feed.active_entry_id == 0 && wcscmp(wl[i].symbol, app->feed.active_symbol) == 0))) {
             active_tok = &wl[i];
             break;
         }
@@ -274,21 +493,6 @@ static void handle_export_csv(AppState* app, HWND hwnd) {
     }
 }
 
-static void handle_export_json(AppState* app, HWND hwnd) {
-    wchar_t clean[32], def_name[64], path[MAX_PATH];
-    sanitize_sym_filename(app->feed.active_symbol, clean, 32);
-    swprintf(def_name, 64, L"openview_%ls_%ls.json", clean, ov_tf_code(app->feed.timeframe));
-    if (prompt_save_file(hwnd, L"Fichiers JSON (*.json)\0*.json\0Tous (*.*)\0*.*\0", L"json", def_name, path, MAX_PATH)) {
-        CandleBar bars[MAX_CANDLES];
-        size_t n = feed_manager_copy_candles(&app->feed, app->feed.primary_source, bars, MAX_CANDLES);
-        export_workspace_json_w(
-            path, app->feed.active_entry_id, is_active_entry_primary(app),
-            app->feed.active_symbol, app->feed.timeframe, app->feed.primary_source,
-            bars, n, &app->drawings, &app->alerts
-        );
-    }
-}
-
 static void show_symbol_menu(AppState* app, HWND hwnd) {
     WatchlistItem wl[MAX_WATCHLIST];
     size_t wn = feed_manager_copy_watchlist(&app->feed, wl, MAX_WATCHLIST);
@@ -328,44 +532,87 @@ static void show_symbol_menu(AppState* app, HWND hwnd) {
     if (cmd >= IDM_SYM_BASE && cmd < IDM_SYM_BASE + (UINT)wn) {
         size_t idx = (size_t)(cmd - IDM_SYM_BASE);
         if (!wl[idx].removed) {
-            feed_manager_set_active_entry(&app->feed, wl[idx].id);
+            select_watchlist_entry(app, wl[idx].id);
+            app->viewport.last_primary_tick_ms = 0;
             app->viewport.draft_count = 0;
             app->viewport.selected_drawing_id = 0;
+            app->viewport.y_pan_factor = 0.0f;
             refresh_analytics(app, hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
         }
     }
 }
 
+typedef struct {
+    AppState* app;
+    HWND hwnd;
+    FeedSourceId source;
+} AddTokenActionContext;
+
+static bool add_token_to_watchlist(
+    void* context,
+    const wchar_t* symbol,
+    const wchar_t* name,
+    const wchar_t* provider_id
+) {
+    AddTokenActionContext* action = (AddTokenActionContext*)context;
+    wchar_t source_suffix[32], attributed_name[48];
+    const wchar_t* source_name = (provider_id && provider_id[0])
+        ? L"CoinGecko"
+        : action->app->feed.sources[action->source].label;
+    if (!source_name[0]) source_name = L"Unknown";
+    swprintf(source_suffix, 32, L" (%ls)", source_name);
+
+    size_t suffix_len = wcslen(source_suffix);
+    size_t name_len = name ? wcslen(name) : 0;
+    if (name_len + suffix_len > 47) name_len = 47 - suffix_len;
+    if (name_len > 0) wmemcpy(attributed_name, name, name_len);
+    wmemcpy(attributed_name + name_len, source_suffix, suffix_len);
+    attributed_name[name_len + suffix_len] = L'\0';
+
+    if (!feed_manager_add_token(&action->app->feed, symbol, attributed_name, provider_id, 0)) {
+        return false;
+    }
+    if (provider_id && provider_id[0]) {
+        feed_manager_set_primary_source(&action->app->feed, SRC_COINGECKO);
+    } else if (action->app->feed.primary_source == SRC_COINGECKO) {
+        feed_manager_set_primary_source(&action->app->feed, action->source);
+        persist_settings(action->app->feed.timeframe, action->source, &action->app->ind_cfg);
+    }
+    persist_drawings(action->app);
+    action->app->viewport.draft_count = 0;
+    action->app->viewport.selected_drawing_id = 0;
+    refresh_analytics(action->app, action->hwnd);
+    InvalidateRect(action->hwnd, NULL, FALSE);
+    return true;
+}
+
 static void handle_add_token(AppState* app, HWND hwnd) {
-    wchar_t raw[32] = L"";
-    if (!ui_show_text_prompt(
-            hwnd, L"Ajouter un token",
-            L"Symbole (ex: AVAX/USDT ou AVAX — cloner si déjà présent) :",
-            raw, 32, false, app->viewport.dark_theme)) {
+    MarketOption* markets = (MarketOption*)calloc(MAX_MARKET_OPTIONS, sizeof(*markets));
+    if (!markets) {
+        MessageBoxW(hwnd, L"Impossible de charger la liste des marchés.",
+                    L"Ajouter un token", MB_OK | MB_ICONERROR);
         return;
     }
-    wchar_t sym[24] = L"";
-    size_t j = 0;
-    for (size_t i = 0; raw[i] && j + 1 < 18; i++) {
-        if (raw[i] == L' ') continue;
-        sym[j++] = (wchar_t)towupper((wint_t)raw[i]);
-    }
-    sym[j] = L'\0';
-    if (!sym[0]) return;
-    if (!wcschr(sym, L'/')) {
-        wcsncat(sym, L"/USDT", 23 - wcslen(sym));
-    }
-    wchar_t base[24];
-    ov_wcscpy(base, 24, sym);
-    wchar_t* slash = wcschr(base, L'/');
-    if (slash) *slash = L'\0';
 
-    feed_manager_add_token(&app->feed, sym, base, 0);
-    app->viewport.draft_count = 0;
-    app->viewport.selected_drawing_id = 0;
-    refresh_analytics(app, hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    FeedSourceId source = app->feed.primary_source == SRC_COINGECKO
+        ? SRC_BINANCE
+        : app->feed.primary_source;
+    size_t market_count = feed_manager_copy_market_cache(
+        &app->feed, source, markets, MAX_MARKET_OPTIONS
+    );
+    if (market_count == 0 && feed_manager_refresh_market_cache(&app->feed, source)) {
+        market_count = feed_manager_copy_market_cache(
+            &app->feed, source, markets, MAX_MARKET_OPTIONS
+        );
+    }
+    AddTokenActionContext action = { app, hwnd, source };
+
+    ui_show_add_token_dialog(
+        hwnd, &app->feed, source, markets, market_count,
+        add_token_to_watchlist, &action, app->viewport.dark_theme
+    );
+    free(markets);
 }
 
 static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, float y_dip) {
@@ -379,8 +626,11 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
     for (int i = 0; i < 9; i++) {
         if (pt_in(L->tf_btns[i], x_dip, y_dip)) {
             feed_manager_set_timeframe(&app->feed, L->tf_values[i]);
+            app->viewport.last_primary_tick_ms = 0;
+            persist_settings(L->tf_values[i], app->feed.primary_source, &app->ind_cfg);
             app->viewport.draft_count = 0;
             app->viewport.pan_bars = 4.0f;
+            app->viewport.y_pan_factor = 0.0f;
             refresh_analytics(app, hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
             return true;
@@ -388,6 +638,7 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
     }
     if (pt_in(L->ind_btn, x_dip, y_dip)) {
         if (ui_show_indicators_dialog(hwnd, &app->ind_cfg, app->viewport.dark_theme)) {
+            persist_settings(app->feed.timeframe, app->feed.primary_source, &app->ind_cfg);
             refresh_analytics(app, hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -396,14 +647,6 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
     if (pt_in(L->sources_btn, x_dip, y_dip)) {
         app->viewport.active_tab = TAB_SOURCES;
         InvalidateRect(hwnd, NULL, FALSE);
-        return true;
-    }
-    if (pt_in(L->export_csv_btn, x_dip, y_dip)) {
-        handle_export_csv(app, hwnd);
-        return true;
-    }
-    if (pt_in(L->export_json_btn, x_dip, y_dip)) {
-        handle_export_json(app, hwnd);
         return true;
     }
     if (pt_in(L->theme_btn, x_dip, y_dip)) {
@@ -425,10 +668,20 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
     for (int c = 0; c < 7; c++) {
         if (pt_in(L->swatch_btns[c], x_dip, y_dip)) {
             app->viewport.drawing_color = L->swatch_colors[c];
+            if (app->viewport.active_tool == TOOL_CURSOR) {
+                for (int kind = TOOL_TRENDLINE; kind <= TOOL_TEXT; kind++) {
+                    app->drawing_defaults[kind].color = L->swatch_colors[c];
+                }
+            } else if (app->viewport.active_tool <= TOOL_TEXT) {
+                app->drawing_defaults[app->viewport.active_tool].color = L->swatch_colors[c];
+            }
             if (app->viewport.selected_drawing_id != 0) {
                 ChartDrawing* dr = drawings_find_by_id(&app->drawings, app->viewport.selected_drawing_id);
                 if (dr) {
                     dr->argb_color = L->swatch_colors[c];
+                    if (dr->kind > TOOL_CURSOR && dr->kind <= TOOL_TEXT) {
+                        app->drawing_defaults[dr->kind].color = dr->argb_color;
+                    }
                     persist_drawings(app);
                 }
             }
@@ -478,6 +731,7 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                     hwnd, L"Nouvelle section", L"Nom de la section (ex: DeFi, Layer 1) :",
                     sname, 48, false, app->viewport.dark_theme)) {
                 feed_manager_add_section(&app->feed, sname);
+                persist_drawings(app);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return true;
@@ -493,6 +747,7 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
             uint32_t sid = L->wl_sec_ids[s];
             if (pt_in(L->wl_sec_del_btns[s], x_dip, y_dip)) {
                 feed_manager_delete_section(&app->feed, sid);
+                persist_drawings(app);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return true;
             }
@@ -505,6 +760,7 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                         hwnd, L"Renommer la section", L"Nouveau nom de la section :",
                         sname, 48, false, app->viewport.dark_theme)) {
                     feed_manager_rename_section(&app->feed, sid, sname);
+                    persist_drawings(app);
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
                 return true;
@@ -527,6 +783,7 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                         hwnd, L"Renommer dans la liste", prompt_lbl,
                         disp, 48, true, app->viewport.dark_theme)) {
                     feed_manager_rename_entry(&app->feed, eid, disp);
+                    persist_drawings(app);
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
                 return true;
@@ -538,12 +795,14 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
                         hwnd, lbl, secs, sn, wl[wi].section_id,
                         &target_sec, app->viewport.dark_theme)) {
                     feed_manager_move_entry(&app->feed, eid, target_sec);
+                    persist_drawings(app);
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
                 return true;
             }
             if (pt_in(L->wl_clone_btns[i], x_dip, y_dip)) {
                 feed_manager_clone_entry(&app->feed, eid);
+                persist_drawings(app);
                 app->viewport.draft_count = 0;
                 app->viewport.selected_drawing_id = 0;
                 refresh_analytics(app, hwnd);
@@ -552,8 +811,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
             }
             if (pt_in(L->wl_del_btns[i], x_dip, y_dip)) {
                 drawings_remove_by_entry(&app->drawings, eid);
-                persist_drawings(app);
                 feed_manager_remove_entry(&app->feed, eid);
+                persist_drawings(app);
                 app->viewport.draft_count = 0;
                 app->viewport.selected_drawing_id = 0;
                 refresh_analytics(app, hwnd);
@@ -625,6 +884,8 @@ static bool handle_toolbar_and_sidebars(AppState* app, HWND hwnd, float x_dip, f
         for (int s = 0; s < SRC_COUNT; s++) {
             if (pt_in(L->src_primary_btns[s], x_dip, y_dip)) {
                 feed_manager_set_primary_source(&app->feed, (FeedSourceId)s);
+                app->viewport.last_primary_tick_ms = 0;
+                persist_settings(app->feed.timeframe, (FeedSourceId)s, &app->ind_cfg);
                 refresh_analytics(app, hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return true;
@@ -652,20 +913,50 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             app->viewport.bar_width      = 10.0f;
             app->viewport.pan_bars       = 4.0f;
             app->viewport.y_scale_factor = 1.0f;
+            app->viewport.y_pan_factor   = 0.0f;
             app->viewport.drawing_color  = 0xFF2962FFU;
             app->viewport.dark_theme     = true;
             app->viewport.active_tab     = TAB_WATCHLIST;
             app->viewport.active_tool    = TOOL_CURSOR;
 
+            for (int kind = TOOL_CURSOR; kind <= TOOL_TEXT; kind++) {
+                DrawingStyleDefaults* style = &app->drawing_defaults[kind];
+                style->color = app->viewport.drawing_color;
+                style->width = 1.8f;
+                style->line_style = LINE_SOLID;
+                style->align_h =
+                    (kind == TOOL_TRENDLINE || kind == TOOL_CHANNEL)
+                    ? ALIGN_H_CENTER : ALIGN_H_LEFT;
+                style->align_v = ALIGN_V_TOP;
+            }
+
             update_titlebar_theme(hwnd, app->viewport.dark_theme);
             d2d_renderer_init(&app->renderer, hwnd);
             indicators_default_settings(&app->ind_cfg);
             drawings_init(&app->drawings);
-            drawings_load_file_w(&app->drawings, L"openview_drawings.json");
+            wchar_t drawings_path[MAX_PATH];
+            if (ov_state_path(drawings_path, MAX_PATH, L"openview_drawings.json")) {
+                drawings_load_file_w(&app->drawings, drawings_path);
+            }
             alerts_init(&app->alerts);
             feed_manager_init(&app->feed, hwnd);
+            AppSettings saved_settings = load_settings();
+            app->ind_cfg = saved_settings.indicators;
+            if (saved_settings.timeframe != TF_15M) {
+                feed_manager_set_timeframe(&app->feed, saved_settings.timeframe);
+            }
+            FeedSourceId saved_source = saved_settings.primary_source;
+            if (app->feed.active_provider_id[0]) {
+                saved_source = SRC_COINGECKO;
+            } else if (saved_source == SRC_COINGECKO) {
+                saved_source = SRC_BINANCE;
+            }
+            if (saved_source != app->feed.primary_source) {
+                feed_manager_set_primary_source(&app->feed, saved_source);
+            }
             refresh_analytics(app, hwnd);
-            SetTimer(hwnd, ID_TOAST_TIMER, 500, NULL);
+            persist_drawings(app);
+            SetTimer(hwnd, ID_TOAST_TIMER, 250, NULL);
             return 0;
         }
 
@@ -679,6 +970,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_APP_FEED_TICK:
         case WM_APP_SNAPSHOT_READY:
             if (app) {
+                if (msg == WM_APP_FEED_TICK &&
+                    wParam < SRC_COUNT &&
+                    (FeedSourceId)wParam == app->feed.primary_source) {
+                    app->viewport.last_primary_tick_ms = GetTickCount64();
+                }
                 refresh_analytics(app, hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -695,10 +991,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         case WM_TIMER:
             if (app && wParam == ID_TOAST_TIMER) {
-                if (app->viewport.has_toast && (int64_t)GetTickCount64() >= app->viewport.toast_until_ms) {
+                uint64_t now_ms = GetTickCount64();
+                bool needs_redraw = false;
+                if (app->viewport.has_toast && (int64_t)now_ms >= app->viewport.toast_until_ms) {
                     app->viewport.has_toast = false;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    needs_redraw = true;
                 }
+                if (app->viewport.last_primary_tick_ms > 0 &&
+                    now_ms >= app->viewport.last_primary_tick_ms &&
+                    now_ms - app->viewport.last_primary_tick_ms < 5500) {
+                    needs_redraw = true;
+                }
+                if (needs_redraw) InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
 
@@ -749,7 +1053,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                             app->viewport.selected_drawing_id = 0;
                             app->drag_mode        = DRAG_PAN;
                             app->drag_start_x_dip = x_dip;
+                            app->drag_start_y_dip = y_dip;
                             app->drag_start_pan   = app->viewport.pan_bars;
+                            app->drag_start_y_pan = app->viewport.y_pan_factor;
                             SetCapture(hwnd);
                             InvalidateRect(hwnd, NULL, FALSE);
                         }
@@ -761,23 +1067,23 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         DrawingToolKind tool = app->viewport.active_tool;
 
                         if (tool == TOOL_HLINE) {
-                            uint32_t nid = drawings_add(
-                                &app->drawings, app->feed.active_entry_id, app->feed.active_symbol, TOOL_HLINE,
-                                &pt, 1, app->viewport.drawing_color, 1.8f, LINE_SOLID, L""
-                            );
+                            uint32_t nid = add_drawing_with_defaults(app, TOOL_HLINE, &pt, 1, NULL);
                             app->viewport.selected_drawing_id = nid;
                             app->viewport.active_tool = TOOL_CURSOR;
                             app->viewport.draft_count = 0;
                             persist_drawings(app);
                         } else if (tool == TOOL_TEXT) {
-                            wchar_t note[64] = L"Note";
+                            wchar_t note[64];
+                            ov_wcscpy(
+                                note, 64,
+                                app->drawing_defaults[TOOL_TEXT].label[0]
+                                    ? app->drawing_defaults[TOOL_TEXT].label
+                                    : L"Note"
+                            );
                             if (ui_show_text_prompt(
                                     hwnd, L"Annotation texte", L"Texte à afficher sur le graphique :",
                                     note, 64, false, app->viewport.dark_theme) && note[0]) {
-                                uint32_t nid = drawings_add(
-                                    &app->drawings, app->feed.active_entry_id, app->feed.active_symbol, TOOL_TEXT,
-                                    &pt, 1, app->viewport.drawing_color, 1.8f, LINE_SOLID, note
-                                );
+                                uint32_t nid = add_drawing_with_defaults(app, TOOL_TEXT, &pt, 1, note);
                                 app->viewport.selected_drawing_id = nid;
                                 persist_drawings(app);
                             }
@@ -789,10 +1095,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                 app->viewport.draft_count  = 1;
                             } else {
                                 app->viewport.draft_pts[1] = pt;
-                                uint32_t nid = drawings_add(
-                                    &app->drawings, app->feed.active_entry_id, app->feed.active_symbol, tool,
-                                    app->viewport.draft_pts, 2,
-                                    app->viewport.drawing_color, 1.8f, LINE_SOLID, L""
+                                uint32_t nid = add_drawing_with_defaults(
+                                    app, tool, app->viewport.draft_pts, 2, NULL
                                 );
                                 app->viewport.selected_drawing_id = nid;
                                 app->viewport.draft_count = 0;
@@ -804,10 +1108,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                 app->viewport.draft_pts[app->viewport.draft_count++] = pt;
                             } else {
                                 app->viewport.draft_pts[2] = pt;
-                                uint32_t nid = drawings_add(
-                                    &app->drawings, app->feed.active_entry_id, app->feed.active_symbol, TOOL_CHANNEL,
-                                    app->viewport.draft_pts, 3,
-                                    app->viewport.drawing_color, 1.8f, LINE_SOLID, L""
+                                uint32_t nid = add_drawing_with_defaults(
+                                    app, TOOL_CHANNEL, app->viewport.draft_pts, 3, NULL
                                 );
                                 app->viewport.selected_drawing_id = nid;
                                 app->viewport.draft_count = 0;
@@ -847,6 +1149,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                     app->viewport.selected_drawing_id = 0;
                                     persist_drawings(app);
                                 } else if (res == 1) {
+                                    if (dr->kind > TOOL_CURSOR && dr->kind <= TOOL_TEXT) {
+                                        DrawingStyleDefaults* style = &app->drawing_defaults[dr->kind];
+                                        style->color = dr->argb_color;
+                                        style->width = dr->stroke_width;
+                                        style->line_style = dr->line_style;
+                                        style->align_h = dr->label_align_h;
+                                        style->align_v = dr->label_align_v;
+                                        ov_wcscpy(style->label, 64, dr->label);
+                                        app->viewport.drawing_color = dr->argb_color;
+                                    }
                                     persist_drawings(app);
                                 }
                                 InvalidateRect(hwnd, NULL, FALSE);
@@ -857,9 +1169,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     app->viewport.pan_bars       = 4.0f;
                     app->viewport.bar_width      = 10.0f;
                     app->viewport.y_scale_factor = 1.0f;
+                    app->viewport.y_pan_factor   = 0.0f;
                     InvalidateRect(hwnd, NULL, FALSE);
                 } else if (pt_in(L->price_axis_rect, x_dip, y_dip)) {
                     app->viewport.y_scale_factor = 1.0f;
+                    app->viewport.y_pan_factor   = 0.0f;
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
             }
@@ -879,11 +1193,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                 app->viewport.wl_drop_entry_id,
                                 app->viewport.wl_drop_after
                             );
+                            persist_drawings(app);
                         }
                     } else {
-                        feed_manager_set_active_entry(&app->feed, app->viewport.wl_drag_id);
+                        select_watchlist_entry(app, app->viewport.wl_drag_id);
+                        app->viewport.last_primary_tick_ms = 0;
                         app->viewport.draft_count = 0;
                         app->viewport.selected_drawing_id = 0;
+                        app->viewport.y_pan_factor = 0.0f;
                         refresh_analytics(app, hwnd);
                     }
                     app->viewport.wl_drag_kind       = 0;
@@ -902,10 +1219,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                 app->viewport.wl_drop_section_id,
                                 app->viewport.wl_drop_after
                             );
+                            persist_drawings(app);
                         }
                     } else {
                         feed_manager_toggle_section(&app->feed, app->viewport.wl_drag_id);
                     }
+                    persist_drawings(app);
                     app->viewport.wl_drag_kind       = 0;
                     app->viewport.wl_drag_id         = 0;
                     app->viewport.wl_drag_active     = false;
@@ -931,11 +1250,21 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     CandleBar bars[MAX_CANDLES];
                     size_t bn = feed_manager_copy_candles(&app->feed, app->feed.primary_source, bars, MAX_CANDLES);
                     float dx = x_dip - app->drag_start_x_dip;
-                    float np = app->drag_start_pan + (dx / app->viewport.bar_width);
+                    float np = app->drag_start_pan - (dx / app->viewport.bar_width);
                     float min_pan = (bn > 12) ? (-(float)bn + 10.0f) : 0.0f;
                     if (np < min_pan) np = min_pan;
                     if (np > 40.0f)   np = 40.0f;
                     app->viewport.pan_bars = np;
+
+                    float main_h = app->renderer.layout.main_pane_rect.bottom -
+                                   app->renderer.layout.main_pane_rect.top;
+                    if (main_h > 1.0f) {
+                        float dy = y_dip - app->drag_start_y_dip;
+                        float y_pan = app->drag_start_y_pan + dy / main_h;
+                        if (y_pan < -5.0f) y_pan = -5.0f;
+                        if (y_pan > 5.0f)  y_pan = 5.0f;
+                        app->viewport.y_pan_factor = y_pan;
+                    }
                 } else if (app->drag_mode == DRAG_Y_SCALE) {
                     float dy = y_dip - app->drag_start_y_dip;
                     float ys = app->drag_start_y_scale * (1.0f + dy * 0.005f);
@@ -1039,7 +1368,17 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         case WM_KEYDOWN:
             if (app) {
-                if (wParam == VK_ESCAPE) {
+                if (wParam == VK_F1) {
+                    MessageBoxW(
+                        hwnd,
+                        L"F1 : afficher cette aide\n"
+                        L"1-9 : changer d'intervalle (1 min, 5 min, 15 min, 1 h, 4 h, 1 j, 1 sem., 1 mois, 1 an)\n"
+                        L"E : exporter les chandelles en CSV\n"
+                        L"Suppr. / Retour arrière : supprimer le dessin sélectionné\n"
+                        L"Échap : annuler le dessin ou le déplacement en cours",
+                        L"Raccourcis clavier", MB_OK | MB_ICONINFORMATION
+                    );
+                } else if (wParam == VK_ESCAPE) {
                     if (app->drag_mode == DRAG_WL_ENTRY || app->drag_mode == DRAG_WL_SECTION) {
                         app->drag_mode                   = DRAG_NONE;
                         app->viewport.wl_drag_kind       = 0;
@@ -1067,6 +1406,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         TF_1M, TF_5M, TF_15M, TF_1H, TF_4H, TF_1D, TF_1W, TF_1MO, TF_1Y
                     };
                     feed_manager_set_timeframe(&app->feed, kTfs[wParam - '1']);
+                    app->viewport.last_primary_tick_ms = 0;
+                    persist_settings(kTfs[wParam - '1'], app->feed.primary_source, &app->ind_cfg);
                     refresh_analytics(app, hwnd);
                     InvalidateRect(hwnd, NULL, FALSE);
                 }

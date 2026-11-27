@@ -7,11 +7,12 @@ Application native Windows en **C11 Unicode** reproduisant fidèlement l'ergonom
 1. **Thread UI (Win32 + Direct2D + DirectWrite)** :
    - Boucle de messages Unicode (`wWinMain`, `GetMessageW` / `DispatchMessageW`) avec support DPI (`PER_MONITOR_AWARE_V2`) et double-clic (`CS_DBLCLKS`).
    - Rendu matériel 60+ FPS via `ID2D1HwndRenderTarget` et `IDWriteFactory` (`COBJMACROS` en C11 pur).
-   - Boîtes de dialogue modales natives (`ui_dialogs.c`) sans fichier `.rc` : paramètres d'indicateurs, propriétés d'un dessin au double-clic (prix, couleur, plein/tirets/pointillés, épaisseur, étiquette, verrouillage, suppression), saisie d'annotations texte / tokens et constructeur d'alertes multi-conditions.
+   - Boîtes de dialogue modales natives (`ui_dialogs.c`) sans fichier `.rc` : paramètres d'indicateurs, propriétés d'un dessin au double-clic (prix, couleur, plein/tirets/pointillés, épaisseur, étiquette, verrouillage, suppression), sélection de tokens avec cache des marchés par exchange et rechargement manuel, saisie d'annotations texte et constructeur d'alertes multi-conditions.
 
 2. **Gestionnaire de Flux Asynchrones Centralisé (`feed_manager.c`)** :
-   - Chargement historique REST HTTPS via **WinHTTP** (`winhttp.lib`) sur `Binance`, `Coinbase` et `Kraken` (incluant les durées `1S`, `1M`, `1A` avec regroupement calendaire).
-   - Un thread dédié par source sur **WinHTTP WebSocket TLS** (`WinHttpWebSocketCompleteUpgrade` chargé dynamiquement pour compatibilité MinGW-w64 & MSVC) + repli synchronisé via **WinSock2** (`ws2_32.lib`).
+   - Chargement historique REST HTTPS via **WinHTTP** (`winhttp.lib`) sur `Binance`, `Coinbase`, `Kraken` et `MEXC` (incluant les durées `1S`, `1M`, `1A` avec regroupement calendaire).
+   - Recherche de tokens via l'API CoinGecko et affichage de leur historique de prix sous forme de bougies. Cette source est historique uniquement, sans flux temps réel.
+   - Un thread dédié par exchange sur **WinHTTP WebSocket TLS** (`WinHttpWebSocketCompleteUpgrade` chargé dynamiquement pour compatibilité MinGW-w64 & MSVC), avec décodage Protobuf du flux de transactions MEXC et repli sur son ticker REST.
    - Tampon circulaire protégé par `SRWLOCK` et `CONDITION_VARIABLE`, et notification UI via `PostMessageW`.
 
 3. **Moteur Analytique, Dessins Persistants, Alertes & Export** :
